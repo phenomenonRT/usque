@@ -209,7 +209,10 @@ var nativeTunCmd = &cobra.Command{
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		go api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
+		tunnelDone := make(chan struct{})
+		go func() {
+			defer close(tunnelDone)
+			api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
 			TLSConfig:         tlsConfig,
 			KeepalivePeriod:   keepalivePeriod,
 			InitialPacketSize: initialPacketSize,
@@ -221,13 +224,16 @@ var nativeTunCmd = &cobra.Command{
 			UseHTTP2:          useHTTP2,
 			OnConnect:         onConnect,
 			OnDisconnect:      onDisconnect,
-			HookEnv:           hookEnv,
-		})
+				HookEnv:           hookEnv,
+			})
+		}()
 
 		log.Println("Tunnel established, you may now set up routing and DNS")
 
 		<-ctx.Done()
-		log.Println("Shutdown signal received; tunnel resources are being closed.")
+		log.Println("Shutdown signal received; waiting for tunnel cleanup.")
+		<-tunnelDone
+		log.Println("Tunnel stopped.")
 	},
 }
 
