@@ -213,17 +213,17 @@ var nativeTunCmd = &cobra.Command{
 		go func() {
 			defer close(tunnelDone)
 			api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
-			TLSConfig:         tlsConfig,
-			KeepalivePeriod:   keepalivePeriod,
-			InitialPacketSize: initialPacketSize,
-			Endpoint:          endpoint,
-			Device:            dev,
-			MTU:               mtu,
-			ReconnectDelay:    reconnectDelay,
-			AlwaysReconnect:   alwaysReconnect,
-			UseHTTP2:          useHTTP2,
-			OnConnect:         onConnect,
-			OnDisconnect:      onDisconnect,
+				TLSConfig:         tlsConfig,
+				KeepalivePeriod:   keepalivePeriod,
+				InitialPacketSize: initialPacketSize,
+				Endpoint:          endpoint,
+				Device:            dev,
+				MTU:               mtu,
+				ReconnectDelay:    reconnectDelay,
+				AlwaysReconnect:   alwaysReconnect,
+				UseHTTP2:          useHTTP2,
+				OnConnect:         onConnect,
+				OnDisconnect:      onDisconnect,
 				HookEnv:           hookEnv,
 			})
 		}()
