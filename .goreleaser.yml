@@ -53,6 +53,12 @@ builds:
         goarch: mips64
       - goos: windows
         goarch: mips64le
+      # android/amd64 and android/arm need cgo (external linking, NDK);
+      # only android/arm64 builds with CGO_ENABLED=0
+      - goos: android
+        goarch: amd64
+      - goos: android
+        goarch: arm
       - goos: android
         goarch: "386"
       - goos: android
