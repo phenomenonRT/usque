@@ -131,7 +131,5 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
-release:
-  github:
-    owner: Diniboy1123
-    name: usque
+# owner/name are detected automatically from the git remote (your fork),
+# so the release is published to this repository.
