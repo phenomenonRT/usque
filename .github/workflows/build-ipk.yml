@@ -1,0 +1,68 @@
+name: Build OpenWrt ipk
+
+# Запуск вручную: Actions → "Build OpenWrt ipk" → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия (пусто = авто, например 2026.10.11-5)"
+        required: false
+        default: ""
+      release:
+        description: "Создать/обновить GitHub Release с .ipk"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  ipk:
+    name: Build ipk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve version
+        id: ver
+        run: |
+          V="${{ inputs.version }}"
+          [ -n "$V" ] || V="$(date -u +%Y.%m.%d)-${{ github.run_number }}"
+          V="${V#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries and .ipk (8 architectures)
+        run: sh scripts/build-ipk.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Checksums
+        run: |
+          mkdir -p out
+          cp dist/ipk/*.ipk out/
+          cd out && sha256sum * > SHA256SUMS.txt && ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usque-ipk-${{ steps.ver.outputs.version }}
+          path: out/*
+          retention-days: 30
+
+      - name: GitHub Release
+        if: ${{ inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* \
+              --title "usque ${{ steps.ver.outputs.version }} (OpenWrt ipk)" \
+              --notes "Пакеты для OpenWrt: usque_<версия>_<арх>_openwrt.ipk. Установка: opkg install ./usque_*.ipk" \
+              --target "${{ github.sha }}"
+          fi
