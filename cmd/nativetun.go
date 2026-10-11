@@ -3,6 +3,9 @@ package cmd
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/Diniboy1123/usque/api"
@@ -203,24 +206,34 @@ var nativeTunCmd = &cobra.Command{
 			"USQUE_IPV6":  config.AppConfig.IPv6,
 		}
 
-		go api.MaintainTunnel(context.Background(), api.MaintainTunnelConfig{
-			TLSConfig:         tlsConfig,
-			KeepalivePeriod:   keepalivePeriod,
-			InitialPacketSize: initialPacketSize,
-			Endpoint:          endpoint,
-			Device:            dev,
-			MTU:               mtu,
-			ReconnectDelay:    reconnectDelay,
-			AlwaysReconnect:   alwaysReconnect,
-			UseHTTP2:          useHTTP2,
-			OnConnect:         onConnect,
-			OnDisconnect:      onDisconnect,
-			HookEnv:           hookEnv,
-		})
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
 
-		log.Println("Tunnel established, you may now set up routing and DNS")
+		tunnelDone := make(chan struct{})
+		go func() {
+			defer close(tunnelDone)
+			api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
+				TLSConfig:         tlsConfig,
+				KeepalivePeriod:   keepalivePeriod,
+				InitialPacketSize: initialPacketSize,
+				Endpoint:          endpoint,
+				Device:            dev,
+				MTU:               mtu,
+				ReconnectDelay:    reconnectDelay,
+				AlwaysReconnect:   alwaysReconnect,
+				UseHTTP2:          useHTTP2,
+				OnConnect:         onConnect,
+				OnDisconnect:      onDisconnect,
+				HookEnv:           hookEnv,
+			})
+		}()
 
-		select {}
+		log.Println("Tunnel supervisor started; configure routing and DNS after the tunnel connects.")
+
+		<-ctx.Done()
+		log.Println("Shutdown signal received; waiting for tunnel cleanup.")
+		<-tunnelDone
+		log.Println("Tunnel stopped.")
 	},
 }
 

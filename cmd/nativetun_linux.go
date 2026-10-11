@@ -27,6 +27,14 @@ func (t *tunDevice) create() (api.TunnelDevice, error) {
 		return nil, err
 	}
 
+	// If address/MTU/link setup fails, release the newly created TUN device.
+	ready := false
+	defer func() {
+		if !ready {
+			_ = dev.Close()
+		}
+	}()
+
 	t.name = dev.Name()
 
 	if t.iproute2 {
@@ -66,5 +74,6 @@ func (t *tunDevice) create() (api.TunnelDevice, error) {
 		log.Printf("IPv6: %s", config.AppConfig.IPv6)
 	}
 
+	ready = true
 	return api.NewWaterAdapter(dev), nil
 }

@@ -106,6 +106,11 @@ func (n *NetstackAdapter) WritePacket(pkt []byte) error {
 	return err
 }
 
+// Close closes the underlying TUN device and unblocks pending reads.
+func (n *NetstackAdapter) Close() error {
+	return n.dev.Close()
+}
+
 // NewNetstackAdapter creates a new NetstackAdapter.
 func NewNetstackAdapter(dev tun.Device) TunnelDevice {
 	return &NetstackAdapter{
@@ -142,6 +147,11 @@ func (w *WaterAdapter) ReadPacket(buf []byte) (int, error) {
 func (w *WaterAdapter) WritePacket(pkt []byte) error {
 	_, err := w.iface.Write(pkt)
 	return err
+}
+
+// Close closes the underlying TUN device and unblocks pending reads.
+func (w *WaterAdapter) Close() error {
+	return w.iface.Close()
 }
 
 // NewWaterAdapter creates a new WaterAdapter.
@@ -211,6 +221,27 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// waitForTunnelError returns when either a forwarding pump reports an error
+// or the tunnel context is cancelled.
+func waitForTunnelError(ctx context.Context, errChan <-chan error) error {
+	select {
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// closeTunnelDevice closes devices that expose Close. This is used only when
+// the owning tunnel context is cancelled, not during ordinary reconnects.
+func closeTunnelDevice(device TunnelDevice) {
+	if closer, ok := device.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			log.Printf("Failed to close TUN device during shutdown: %v", err)
+		}
+	}
+}
+
 // MaintainTunnel continuously connects to the MASQUE server, then starts two
 // forwarding goroutines: one forwarding from the device to the IP connection (and handling
 // any ICMP reply), and the other forwarding from the IP connection to the device.
@@ -229,6 +260,14 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			log.Fatalf("MaintainTunnel: HTTP/3 mode requires a *net.UDPAddr endpoint, got %T", cfg.Endpoint)
 		}
 	}
+
+	// Cancellation must also interrupt blocking TUN reads, including the idle
+	// wait before a connection is established. The concrete adapters close the
+	// underlying device; ordinary reconnects leave it open.
+	stopCloseDevice := context.AfterFunc(ctx, func() {
+		closeTunnelDevice(cfg.Device)
+	})
+	defer stopCloseDevice()
 
 	packetBufferPool := NewNetBuffer(cfg.MTU + datagramContextIDHeadroom)
 
@@ -375,10 +414,14 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			}
 		}()
 
-		err = <-errChan
-		log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
+		err = waitForTunnelError(ctx, errChan)
+		if ctx.Err() != nil {
+			log.Printf("Stopping tunnel: %v", ctx.Err())
+		} else {
+			log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
+		}
 
-		if cfg.OnDisconnect != "" {
+		if ctx.Err() == nil && cfg.OnDisconnect != "" {
 			env := cloneHookEnv(cfg.HookEnv)
 			env["USQUE_EVENT"] = "disconnect"
 			env["USQUE_ENDPOINT"] = cfg.Endpoint.String()
@@ -404,6 +447,9 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 		}
 		if udpConn != nil {
 			_ = udpConn.Close()
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
 			return
