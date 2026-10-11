@@ -228,7 +228,7 @@ var nativeTunCmd = &cobra.Command{
 			})
 		}()
 
-		log.Println("Tunnel established, you may now set up routing and DNS")
+		log.Println("Tunnel supervisor started; configure routing and DNS after the tunnel connects.")
 
 		<-ctx.Done()
 		log.Println("Shutdown signal received; waiting for tunnel cleanup.")
