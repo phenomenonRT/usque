@@ -23,6 +23,16 @@ func (d *testTunnelDevice) Close() error {
 	return nil
 }
 
+type nonClosableTunnelDevice struct{}
+
+func (nonClosableTunnelDevice) ReadPacket([]byte) (int, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (nonClosableTunnelDevice) WritePacket([]byte) error {
+	return nil
+}
+
 func TestWaitForTunnelErrorReturnsReportedError(t *testing.T) {
 	want := errors.New("pump failed")
 	errChan := make(chan error, 1)
@@ -53,13 +63,6 @@ func TestCloseTunnelDeviceClosesClosableDevice(t *testing.T) {
 }
 
 func TestCloseTunnelDeviceAcceptsDeviceWithoutClose(t *testing.T) {
-	type nonClosableDevice struct{}
-	device := nonClosableDevice{}
-
-	// A device without Close is not closed by this helper.
-	closeTunnelDevice(deviceAdapter{TunnelDevice: device})
-}
-
-type deviceAdapter struct {
-	TunnelDevice
+	// Optional Close support preserves compatibility with other TunnelDevice implementations.
+	closeTunnelDevice(nonClosableTunnelDevice{})
 }
