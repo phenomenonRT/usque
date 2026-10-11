@@ -1,0 +1,84 @@
+version: 2
+
+project_name: usque
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: usque
+    binary: usque
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+      - android
+    goarch:
+      - amd64
+      - arm64
+      - arm
+      - "386"
+      - mips
+      - mipsle
+      - mips64
+      - mips64le
+    goarm:
+      - "5"
+      - "6"
+      - "7"
+    gomips:
+      - hardfloat
+    ignore:
+      - goos: darwin
+        goarch: arm
+      - goos: darwin
+        goarch: "386"
+      - goos: darwin
+        goarch: mips
+      - goos: darwin
+        goarch: mipsle
+      - goos: darwin
+        goarch: mips64
+      - goos: darwin
+        goarch: mips64le
+      - goos: windows
+        goarch: mips
+      - goos: windows
+        goarch: mipsle
+      - goos: windows
+        goarch: mips64
+      - goos: windows
+        goarch: mips64le
+      - goos: android
+        goarch: "386"
+      - goos: android
+        goarch: mips
+      - goos: android
+        goarch: mipsle
+      - goos: android
+        goarch: mips64
+      - goos: android
+        goarch: mips64le
+    ldflags:
+      - -s -w -X github.com/Diniboy1123/usque/cmd.version={{.Version}} -X github.com/Diniboy1123/usque/cmd.commit={{.Commit}} -X github.com/Diniboy1123/usque/cmd.date={{.Date}}
+
+archives:
+  - id: usque
+    formats:
+      - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+
+changelog:
+  use: git
+
+release:
+  github:
+    owner: phenomenonRT
+    name: usque
