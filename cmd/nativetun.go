@@ -3,6 +3,9 @@ package cmd
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/Diniboy1123/usque/api"
@@ -203,7 +206,10 @@ var nativeTunCmd = &cobra.Command{
 			"USQUE_IPV6":  config.AppConfig.IPv6,
 		}
 
-		go api.MaintainTunnel(context.Background(), api.MaintainTunnelConfig{
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		go api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
 			TLSConfig:         tlsConfig,
 			KeepalivePeriod:   keepalivePeriod,
 			InitialPacketSize: initialPacketSize,
@@ -220,7 +226,8 @@ var nativeTunCmd = &cobra.Command{
 
 		log.Println("Tunnel established, you may now set up routing and DNS")
 
-		select {}
+		<-ctx.Done()
+		log.Println("Shutdown signal received; tunnel resources are being closed.")
 	},
 }
 
