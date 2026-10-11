@@ -235,6 +235,9 @@ func waitForTunnelError(ctx context.Context, errChan <-chan error) error {
 // closeTunnelDevice closes devices that expose Close. This is used only when
 // the owning tunnel context is cancelled, not during ordinary reconnects.
 func closeTunnelDevice(device TunnelDevice) {
+	if device == nil {
+		return
+	}
 	if closer, ok := device.(interface{ Close() error }); ok {
 		if err := closer.Close(); err != nil {
 			log.Printf("Failed to close TUN device during shutdown: %v", err)
@@ -267,6 +270,8 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 	stopCloseDevice := context.AfterFunc(ctx, func() {
 		closeTunnelDevice(cfg.Device)
 	})
+	// Ensure AfterFunc is cancelled before MaintainTunnel returns so it never
+	// fires after the function has exited.
 	defer stopCloseDevice()
 
 	packetBufferPool := NewNetBuffer(cfg.MTU + datagramContextIDHeadroom)

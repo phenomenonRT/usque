@@ -30,7 +30,7 @@ func (t *tunDevice) create() (api.TunnelDevice, error) {
 	// If address/MTU/link setup fails, release the newly created TUN device.
 	ready := false
 	defer func() {
-		if !ready {
+		if !ready && dev != nil {
 			_ = dev.Close()
 		}
 	}()
