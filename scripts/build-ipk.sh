@@ -95,17 +95,20 @@ done
 mk_proto() {
   w="$T/proto"; mkdir -p "$w/data" "$w/control"
   cp -a scripts/ipk/proto/. "$w/data/"
-  chmod 755 "$w/data/lib/netifd/proto/usque.sh" "$w/data/usr/lib/usque/netifd-hook.sh"
-  chmod 644 "$w/data/www/luci-static/resources/protocol/usque.js"
+  chmod 755 "$w/data/lib/netifd/proto/usque.sh" "$w/data/usr/lib/usque/netifd-hook.sh" \
+    "$w/data/usr/lib/usque/run.sh" "$w/data/usr/libexec/rpcd/usque"
+  chmod 644 "$w/data/www/luci-static/resources/protocol/usque.js" \
+    "$w/data/usr/share/rpcd/acl.d/luci-proto-usque.json"
 
   cat > "$w/control/postinst" <<'EOS'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT:-}" ] && exit 0
 rm -f /tmp/luci-indexcache
 rm -rf /tmp/luci-modulecache/
+/etc/init.d/rpcd restart 2>/dev/null
 echo "usque-proto установлен. Чтобы netifd увидел протокол «usque», выполните:"
 echo "  /etc/init.d/network restart"
-echo "Затем: Network → Interfaces → Add new interface → Cloudflare WARP (usque / MASQUE)"
+echo "Затем войдите в LuCI заново: Network → Interfaces → Add new interface → Cloudflare WARP (usque / MASQUE)"
 exit 0
 EOS
   cat > "$w/control/prerm" <<'EOS'

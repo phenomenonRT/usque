@@ -1,0 +1,15 @@
+{
+	"luci-proto-usque": {
+		"description": "Grant access to the usque WARP interface status and controls",
+		"read": {
+			"ubus": {
+				"usque": [ "info" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"usque": [ "start", "stop", "restart", "register" ]
+			}
+		}
+	}
+}

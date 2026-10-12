@@ -1,0 +1,194 @@
+#!/bin/sh
+# rpcd-плагин "usque": состояние и управление интерфейсом WARP для страницы LuCI.
+# Методы: info, start, stop, restart, register. JSON приходит в stdin, ответ — в stdout.
+# Закрытый ключ из config.json наружу не отдаётся: только адреса эндпоинтов и адрес в тоннеле.
+
+STATE=/var/run/usque
+BIN=/usr/bin/usque
+
+# --- вспомогательное ---------------------------------------------------------
+
+valid_iface() {
+	case "$1" in "" | *[!A-Za-z0-9_]*) return 1 ;; esac
+	[ "${#1}" -le 9 ]
+}
+
+valid_cfg() {
+	case "$1" in /*.json) ;; *) return 1 ;; esac
+	case "$1" in *..* | *[!A-Za-z0-9._/-]*) return 1 ;; esac
+	return 0
+}
+
+# строка -> JSON-строка (без кавычек вокруг)
+jesc() {
+	printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# многострочный текст со stdin -> одна JSON-строка с \n
+jlines() {
+	tr -d '\000-\011\013-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' |
+		awk 'BEGIN { ORS = "" } { if (NR > 1) print "\\n"; print $0 }'
+}
+
+jbool() { [ "$1" = 1 ] && printf true || printf false; }
+
+kv() { # файл ключ
+	sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1
+}
+
+cfgval() { # файл ключ
+	jsonfilter -i "$1" -e "@.$2" 2>/dev/null
+}
+
+arg() { # ключ
+	jsonfilter -s "$INPUT" -e "@.$1" 2>/dev/null
+}
+
+alive() { # iface
+	local pid
+	pid="$(cat "$STATE/$1.pid" 2>/dev/null)"
+	[ -n "$pid" ] && [ -d "/proc/$pid" ]
+}
+
+reply_err() { # код [текст]
+	printf '{"ok":false,"code":"%s","output":"%s"}\n' "$1" "$(jesc "$2")"
+}
+
+# --- методы ------------------------------------------------------------------
+
+do_info() {
+	local iface cfg exists=0 running=0 up=0 netifd_up=0
+	local mode port endpoint sni profile log
+
+	iface="$(arg iface)"
+	cfg="$(arg config)"
+	[ -n "$cfg" ] || cfg=/etc/usque/config.json
+	valid_iface "$iface" || { reply_err BAD_IFACE; return; }
+
+	[ -r "$cfg" ] && valid_cfg "$cfg" && exists=1
+	alive "$iface" && running=1
+	[ -e "$STATE/$iface.up" ] && up=1
+	[ "$(ubus call "network.interface.$iface" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = true ] && netifd_up=1
+
+	mode="$(kv "$STATE/$iface.cur" mode)"
+	port="$(kv "$STATE/$iface.cur" port)"
+	endpoint="$(kv "$STATE/$iface.cur" endpoint)"
+	sni="$(kv "$STATE/$iface.cur" sni)"
+	profile="$(kv "$STATE/$iface.cur" profile)"
+	log="$(tail -n 15 "$STATE/$iface.log" 2>/dev/null | jlines)"
+
+	printf '{"ok":true,"config_exists":%s,"running":%s,"up":%s,"netifd_up":%s,' \
+		"$(jbool $exists)" "$(jbool $running)" "$(jbool $up)" "$(jbool $netifd_up)"
+	printf '"mode":"%s","port":"%s","endpoint":"%s","sni":"%s","profile":"%s",' \
+		"$(jesc "$mode")" "$(jesc "$port")" "$(jesc "$endpoint")" "$(jesc "$sni")" "$(jesc "$profile")"
+	if [ "$exists" = 1 ]; then
+		printf '"endpoint_v4":"%s","endpoint_v6":"%s","endpoint_h2_v4":"%s","endpoint_h2_v6":"%s","ipv4":"%s","ipv6":"%s",' \
+			"$(jesc "$(cfgval "$cfg" endpoint_v4)")" "$(jesc "$(cfgval "$cfg" endpoint_v6)")" \
+			"$(jesc "$(cfgval "$cfg" endpoint_h2_v4)")" "$(jesc "$(cfgval "$cfg" endpoint_h2_v6)")" \
+			"$(jesc "$(cfgval "$cfg" ipv4)")" "$(jesc "$(cfgval "$cfg" ipv6)")"
+	fi
+	printf '"log":"%s"}\n' "$log"
+}
+
+do_start() {
+	local iface
+	iface="$(arg iface)"
+	valid_iface "$iface" || { reply_err BAD_IFACE; return; }
+	ifup "$iface" >/dev/null 2>&1
+	printf '{"ok":true}\n'
+}
+
+do_stop() {
+	local iface pid fam ep
+	iface="$(arg iface)"
+	valid_iface "$iface" || { reply_err BAD_IFACE; return; }
+
+	ifdown "$iface" >/dev/null 2>&1
+	sleep 1
+
+	# если netifd не успел или состояние сбилось — добиваем сами
+	pid="$(cat "$STATE/$iface.pid" 2>/dev/null)"
+	if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+		kill "$pid" 2>/dev/null
+		sleep 1
+		[ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null
+	fi
+	if [ -r "$STATE/$iface.route" ]; then
+		read -r fam ep < "$STATE/$iface.route"
+		[ -n "$ep" ] && ip $fam route del "$ep" 2>/dev/null
+	fi
+	rm -f "$STATE/$iface.up" "$STATE/$iface.cur" "$STATE/$iface.pid" \
+		"$STATE/$iface.route" "$STATE/$iface.json"
+	printf '{"ok":true}\n'
+}
+
+do_restart() {
+	local iface
+	iface="$(arg iface)"
+	valid_iface "$iface" || { reply_err BAD_IFACE; return; }
+	ifdown "$iface" >/dev/null 2>&1
+	sleep 1
+	ifup "$iface" >/dev/null 2>&1
+	printf '{"ok":true}\n'
+}
+
+do_register() {
+	local cfg name force out rc
+
+	cfg="$(arg config)"
+	name="$(arg name)"
+	force="$(arg force)"
+	[ -n "$cfg" ] || cfg=/etc/usque/config.json
+	valid_cfg "$cfg" || { reply_err BAD_CONFIG_PATH "путь должен быть абсолютным и заканчиваться на .json"; return; }
+	case "$name" in *[!A-Za-z0-9._-]*) reply_err BAD_NAME "имя: латиница, цифры, . _ -"; return ;; esac
+	[ -x "$BIN" ] || { reply_err NO_BINARY; return; }
+
+	if [ -e "$cfg" ]; then
+		[ "$force" = 1 ] || { reply_err EXISTS "конфиг уже есть"; return; }
+		cp "$cfg" "$cfg.bak" 2>/dev/null
+	fi
+	mkdir -p "$(dirname "$cfg")"
+
+	# usque спрашивает "overwrite? (y/n)", если конфиг уже существует
+	if command -v timeout >/dev/null 2>&1; then
+		out="$(echo y | timeout 25 "$BIN" -c "$cfg" register -a ${name:+-n "$name"} 2>&1)"
+	else
+		out="$(echo y | "$BIN" -c "$cfg" register -a ${name:+-n "$name"} 2>&1)"
+	fi
+	rc=$?
+	[ -f "$cfg" ] && chmod 600 "$cfg"
+
+	if [ "$rc" = 0 ] && [ -s "$cfg" ]; then
+		printf '{"ok":true,"output":"%s"}\n' "$(printf '%s' "$out" | tail -n 8 | jlines)"
+	else
+		printf '{"ok":false,"code":"REGISTER_FAILED","output":"%s"}\n' "$(printf '%s' "$out" | tail -n 8 | jlines)"
+	fi
+}
+
+# --- точка входа rpcd --------------------------------------------------------
+
+case "$1" in
+list)
+	cat <<'EOF'
+{
+	"info": { "iface": "str", "config": "str" },
+	"start": { "iface": "str" },
+	"stop": { "iface": "str" },
+	"restart": { "iface": "str" },
+	"register": { "config": "str", "name": "str", "force": 0 }
+}
+EOF
+	;;
+call)
+	INPUT="$(cat)"
+	[ -n "$INPUT" ] || INPUT='{}'
+	case "$2" in
+	info) do_info ;;
+	start) do_start ;;
+	stop) do_stop ;;
+	restart) do_restart ;;
+	register) do_register ;;
+	*) reply_err UNKNOWN_METHOD ;;
+	esac
+	;;
+esac
