@@ -90,4 +90,54 @@ EOS
 for a in amd64 arm64 armv7 armv5 mipsle mips mips64 mips64le; do
   mk "$a"
 done
+
+# usque-proto: протокол netifd + страница LuCI (не зависит от архитектуры)
+mk_proto() {
+  w="$T/proto"; mkdir -p "$w/data" "$w/control"
+  cp -a scripts/ipk/proto/. "$w/data/"
+  chmod 755 "$w/data/lib/netifd/proto/usque.sh" "$w/data/usr/lib/usque/netifd-hook.sh"
+  chmod 644 "$w/data/www/luci-static/resources/protocol/usque.js"
+
+  cat > "$w/control/postinst" <<'EOS'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+rm -f /tmp/luci-indexcache
+rm -rf /tmp/luci-modulecache/
+echo "usque-proto установлен. Чтобы netifd увидел протокол «usque», выполните:"
+echo "  /etc/init.d/network restart"
+echo "Затем: Network → Interfaces → Add new interface → Cloudflare WARP (usque / MASQUE)"
+exit 0
+EOS
+  cat > "$w/control/prerm" <<'EOS'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+rm -f /tmp/luci-indexcache
+rm -rf /tmp/luci-modulecache/
+exit 0
+EOS
+  chmod 755 "$w/control/postinst" "$w/control/prerm"
+
+  size=$(du -sk "$w/data" | cut -f1); size=$((size*1024))
+  cat > "$w/control/control" <<EOS
+Package: usque-proto
+Version: $VER
+Depends: usque
+Source: usque
+Section: net
+Priority: optional
+Maintainer: usque
+Architecture: all
+Installed-Size: $size
+Description: netifd protocol and LuCI page: Cloudflare WARP (usque) as a network interface
+EOS
+
+  ( cd "$w/control" && $TAR -czf ../control.tar.gz ./control ./postinst ./prerm )
+  ( cd "$w/data"    && $TAR -czf ../data.tar.gz . )
+  echo "2.0" > "$w/debian-binary"
+  f="$OUT/usque-proto_${VER}_all.ipk"
+  ( cd "$w" && $TAR -czf "$f" ./debian-binary ./data.tar.gz ./control.tar.gz )
+  echo "==> $f"
+}
+mk_proto
+
 ls -l "$OUT"

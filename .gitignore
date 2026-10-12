@@ -26,7 +26,7 @@ go.work.sum
 
 # Usque specific
 config*.json*
-usque
+/usque
 usque.exe
 dist/.vscode/
 .vscode/

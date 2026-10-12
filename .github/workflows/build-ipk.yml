@@ -63,6 +63,6 @@ jobs:
           else
             gh release create "$TAG" out/* \
               --title "usque ${{ steps.ver.outputs.version }} (OpenWrt ipk)" \
-              --notes "Пакеты для OpenWrt: usque_<версия>_<арх>_openwrt.ipk. Установка: opkg install ./usque_*.ipk" \
+              --notes "OpenWrt: usque_<версия>_<арх>_openwrt.ipk (клиент + служба) и usque-proto_<версия>_all.ipk (интерфейс netifd + LuCI, нужен usque). Инструкция: _docs/openwrt.md" \
               --target "${{ github.sha }}"
           fi
