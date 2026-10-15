@@ -575,18 +575,20 @@ TSPU (the Russian DPI system) and similar middleboxes do not only match on the S
 usque --config config.json nativetun --bypass -n usque0
 ```
 
-When `--bypass` is set, the client tries the following combinations until one connects, remembers the winner and prefers it on reconnect:
+When `--bypass` is set, the client walks the combinations **breadth-first** — the first couple of dozen attempts cover every dimension (transport, port, SNI, address) instead of exhausting one — until one connects. Names outside Cloudflare are tried first, because the server accepts any name and TSPU blocks Cloudflare domains by SNI. The winner is remembered and preferred on reconnect:
 
-1. **Port sweep** — the configured server address with the standard port first (443) and the documented fallbacks (`500`, `1701`, `4500`, `4443`, `8443`, `8095`) after it.
-2. **SNI sweep** — alternative names in the TLS handshake (`zt-masque.cloudflareclient.com`, `one.one.one.one`, `www.cloudflare.com`, plus the non-Cloudflare `www.microsoft.com`, `www.apple.com`, `www.bing.com`). Passing `-s` disables the sweep and pins your own name.
-3. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses (`162.159.197.0/24`, `162.159.192.1`, `162.159.193.1`, `162.159.195.1`, `162.159.204.1`, …).
-4. **Address × SNI pairs** for the remaining combinations.
+1. **Transport** — QUIC first, then HTTP/2 over TCP+TLS (which can be fragmented, see below).
+2. **Port sweep** — the configured server address with the standard port first (443) and the documented fallbacks (`500`, `1701`, `4500`, `4443`, `8443`, `8095`) after it.
+3. **SNI sweep** — `www.microsoft.com`, `www.apple.com`, `www.bing.com`, then the Cloudflare names (`one.one.one.one`, `www.cloudflare.com`, `zt-masque.cloudflareclient.com`, `consumer-masque.cloudflareclient.com`). Passing `-s` disables the sweep and pins your own name.
+4. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses (`162.159.197.0/24`, `162.159.192.0/24`, `162.159.193.0/24`, `162.159.195.0/24`, `162.159.204.0/24`).
+5. **Address × SNI pairs** for the remaining combinations.
 
 Additional knobs:
 
 - `--bypass-endpoint <ip>` (repeatable) — add your own server addresses to the end of the sweep.
 - `--bypass-sni <name>` (repeatable) — replace the built-in SNI list with your own names. Use this when your provider blocks Cloudflare domains by SNI: the server ignores the name (the client pins the endpoint's public key, not the certificate name), so any non-blocked domain works. Example: `--bypass --bypass-sni www.example.com`.
-- `--tls-fragment` / `--tls-fragment-sizes` — for HTTP/2 candidates, split the TLS ClientHello into separate TCP segments so a middlebox cannot see the handshake in one packet (default: 1 byte, then the rest).
+- `--tls-fragment` — for HTTP/2 candidates, split the TLS ClientHello into separate TCP segments so a middlebox cannot see the handshake in one packet. By default the split lands **in the middle of the host name**, so the SNI itself is broken across segments; `--tls-fragment-sizes` sets explicit segment sizes, `--tls-fragment-delay` adds a pause between segments.
+- `--bypass-parallel <n>` — keep that many attempts in flight at once (default `3`). Since blocked combinations cost a full timeout each, this cuts the time to find a working one by roughly the same factor.
 - `--connect-timeout` — bound a single candidate attempt (default `5s`), so silently dropped addresses are skipped quickly.
 - In bypass mode the initial QUIC packet is capped at 1200 bytes, which disables PMTU probing with large packets that are often dropped silently.
 

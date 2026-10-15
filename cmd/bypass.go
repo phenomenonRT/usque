@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/Diniboy1123/usque/api"
@@ -32,6 +33,7 @@ type tunnelPlan struct {
 	Candidates        []api.TunnelCandidate
 	Fragment          *api.TLSFragmentConfig
 	ConnectTimeout    time.Duration
+	Parallel          int
 }
 
 // addBypassFlags добавляет общие флаги обхода ТСПУ ко всем туннельным командам.
@@ -43,11 +45,40 @@ func addBypassFlags(c *cobra.Command) {
 	c.Flags().StringArray("bypass-sni", nil,
 		"Свои SNI для перебора в режиме --bypass (можно несколько раз). Полностью заменяет встроенный список имён — пригодится, когда провайдер блокирует домены Cloudflare по SNI. Подходит любое незаблокированное имя.")
 	c.Flags().Bool("tls-fragment", true,
-		"В режиме --bypass дробить TLS ClientHello на несколько TCP-сегментов (для HTTP/2).")
-	c.Flags().IntSlice("tls-fragment-sizes", []int{1},
-		"Размеры первых сегментов TLS ClientHello в режиме --bypass (по умолчанию 1 байт, затем остальное).")
+		"В режиме --bypass дробить TLS ClientHello так, чтобы имя сервера (SNI) разрывалось между TCP-сегментами (для HTTP/2).")
+	c.Flags().IntSlice("tls-fragment-sizes", nil,
+		"Явные размеры первых сегментов TLS ClientHello в режиме --bypass (по умолчанию разрыв в середине SNI).")
+	c.Flags().Duration("tls-fragment-delay", 0,
+		"Пауза между сегментами TLS ClientHello в режиме --bypass (0 — без паузы).")
 	c.Flags().Duration("connect-timeout", 0,
 		"Таймаут одной попытки при переборе (--bypass). 0 — по умолчанию 5s.")
+	c.Flags().Int("bypass-parallel", 3,
+		"Сколько комбинаций пробовать одновременно в режиме --bypass (1 — по очереди). Больше — быстрее поиск, но заметнее для DPI.")
+}
+
+// buildTLSFragment собирает настройки дробления TLS ClientHello из флагов.
+// Возвращает nil, если дробление выключено.
+func buildTLSFragment(cmd *cobra.Command) (*api.TLSFragmentConfig, error) {
+	frag, err := cmd.Flags().GetBool("tls-fragment")
+	if err != nil || !frag {
+		return nil, err
+	}
+
+	cfg := &api.TLSFragmentConfig{Auto: true}
+	if cmd.Flags().Changed("tls-fragment-sizes") {
+		sizes, err := cmd.Flags().GetIntSlice("tls-fragment-sizes")
+		if err != nil {
+			return nil, err
+		}
+		if len(sizes) > 0 {
+			cfg.Sizes = sizes
+			cfg.Auto = false
+		}
+	}
+	if cfg.Delay, err = cmd.Flags().GetDuration("tls-fragment-delay"); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 // buildTunnelPlan разбирает общие флаги команды и строит либо одиночное
@@ -105,15 +136,14 @@ func buildTunnelPlan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *
 		connectTimeout = defaultBypassConnectTimeout
 	}
 
-	fragment := &api.TLSFragmentConfig{}
-	if frag, err := cmd.Flags().GetBool("tls-fragment"); err != nil {
+	fragment, err := buildTLSFragment(cmd)
+	if err != nil {
 		return plan, err
-	} else if frag {
-		sizes, err := cmd.Flags().GetIntSlice("tls-fragment-sizes")
-		if err != nil {
-			return plan, err
-		}
-		fragment.Sizes = sizes
+	}
+
+	parallel, err := bypassParallel(cmd)
+	if err != nil {
+		return plan, err
 	}
 
 	extraEndpoints, err := cmd.Flags().GetStringArray("bypass-endpoint")
@@ -150,7 +180,63 @@ func buildTunnelPlan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *
 	ports := dedupeInts(prependInt(connectPort, internal.BypassQUICPorts))
 	h2Ports := dedupeInts(prependInt(connectPort, []int{internal.BypassH2Port}))
 
-	defaultSNI := snis[0]
+	candidates := buildCandidates(candidateInput{
+		SNIs:     snis,
+		TLSBySNI: tlsBySNI,
+		QUICIPs:  quicIPs,
+		H2IPs:    h2IPs,
+		Ports:    ports,
+		H2Ports:  h2Ports,
+		UseHTTP2: useHTTP2,
+	})
+	if len(candidates) == 0 {
+		return plan, fmt.Errorf("не удалось построить список подключений для обхода")
+	}
+
+	plan.Candidates = candidates
+	plan.Fragment = fragment
+	plan.ConnectTimeout = connectTimeout
+	plan.Parallel = parallel
+	return plan, nil
+}
+
+// candidateInput — всё, что нужно, чтобы собрать список комбинаций для перебора.
+type candidateInput struct {
+	// SNIs — имена в порядке перебора; первое используется в переборах портов
+	// и адресов.
+	SNIs []string
+	// TLSBySNI сопоставляет имя готовой конфигурации TLS.
+	TLSBySNI map[string]*tls.Config
+	// QUICIPs и H2IPs — адреса сервера для QUIC и HTTP/2 соответственно.
+	QUICIPs []string
+	H2IPs   []string
+	// Ports — порты UDP для перебора, H2Ports — порты TCP для основного адреса.
+	Ports   []int
+	H2Ports []int
+	// UseHTTP2 — пользователь явно попросил HTTP/2, тогда он идёт первым.
+	UseHTTP2 bool
+}
+
+// buildCandidates собирает список комбинаций «адрес + порт + транспорт + SNI».
+//
+// Порядок «в ширину»: за первые два десятка попыток пробуются все измерения
+// (транспорт, порт, SNI, адрес), а не исчерпывается одно. Заблокированная
+// комбинация стоит полного таймаута, поэтому ширина важнее глубины: рабочая
+// комбинация находится за десятки секунд, а не за минуты.
+func buildCandidates(in candidateInput) []api.TunnelCandidate {
+	if len(in.SNIs) == 0 {
+		return nil
+	}
+
+	primarySNI := in.SNIs[0]
+	quicPort := internal.BypassQUICPorts[0]
+	if len(in.Ports) > 0 {
+		quicPort = in.Ports[0]
+	}
+	h2Port := internal.BypassH2Port
+	primaryQUIC := firstOrEmpty(in.QUICIPs)
+	primaryH2 := firstOrEmpty(in.H2IPs)
+
 	var candidates []api.TunnelCandidate
 	seen := make(map[string]struct{})
 
@@ -158,7 +244,7 @@ func buildTunnelPlan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *
 		if len(candidates) >= maxBypassCandidates || ip == "" {
 			return
 		}
-		tlsCfg := tlsBySNI[sni]
+		tlsCfg := in.TLSBySNI[sni]
 		if tlsCfg == nil {
 			return
 		}
@@ -188,46 +274,68 @@ func buildTunnelPlan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *
 		})
 	}
 
-	// 1. Перебор портов и транспорта на основном адресе (ловит резаный UDP/порт).
-	for _, p := range ports {
-		add(defaultSNI, quicIPs[0], false, p)
+	// 1. Оба транспорта на основном адресе: сначала QUIC (быстрее), затем
+	//    HTTP/2 с дроблением ClientHello.
+	add(primarySNI, primaryQUIC, false, quicPort)
+	for _, p := range in.H2Ports {
+		add(primarySNI, primaryH2, true, p)
 	}
-	for _, p := range h2Ports {
-		add(defaultSNI, h2IPs[0], true, p)
+
+	// 2. Запасные UDP-порты Cloudflare (порт-хопинг) на основном адресе.
+	for _, p := range in.Ports[1:] {
+		add(primarySNI, primaryQUIC, false, p)
 	}
-	// 2. Перебор SNI на основном адресе (ловит блокировку по имени).
-	for _, s := range snis[1:] {
-		add(s, quicIPs[0], false, 443)
-		add(s, h2IPs[0], true, 443)
+
+	// 3. Прочие SNI на основном адресе. HTTP/2 идёт первым: там ClientHello
+	//    дробится и имя сервера не видно DPI целиком.
+	for _, s := range in.SNIs[1:] {
+		add(s, primaryH2, true, h2Port)
+		add(s, primaryQUIC, false, quicPort)
 	}
-	// 3. Перебор адресов сервера (ловит блокировку по IP/подсети).
-	for _, ip := range quicIPs[1:] {
-		add(defaultSNI, ip, false, 443)
-	}
-	for _, ip := range h2IPs[1:] {
-		add(defaultSNI, ip, true, 443)
-	}
-	// 4. Перебор пар «адрес × SNI».
-	for _, s := range snis[1:] {
-		for _, ip := range quicIPs[1:] {
-			add(s, ip, false, 443)
+
+	// 4. Прочие адреса сервера — оба транспорта по разу.
+	for i := 1; i < len(in.QUICIPs) || i < len(in.H2IPs); i++ {
+		if i < len(in.H2IPs) {
+			add(primarySNI, in.H2IPs[i], true, h2Port)
+		}
+		if i < len(in.QUICIPs) {
+			add(primarySNI, in.QUICIPs[i], false, quicPort)
 		}
 	}
 
-	if len(candidates) == 0 {
-		return plan, fmt.Errorf("не удалось построить список подключений для обхода")
+	// 5. Оставшиеся пары «адрес × SNI».
+	for _, s := range in.SNIs[1:] {
+		for i := 1; i < len(in.QUICIPs) || i < len(in.H2IPs); i++ {
+			if i < len(in.QUICIPs) {
+				add(s, in.QUICIPs[i], false, quicPort)
+			}
+			if i < len(in.H2IPs) {
+				add(s, in.H2IPs[i], true, h2Port)
+			}
+		}
 	}
 
 	// Если пользователь просил HTTP/2, пробуем его первым: TSPU, режущий UDP,
 	// иначе заставил бы ждать таймаут каждой QUIC-комбинации.
-	if useHTTP2 {
+	if in.UseHTTP2 {
 		candidates = preferHTTP2(candidates)
 	}
+	return candidates
+}
 
-	plan.Candidates = candidates
-	plan.Fragment = fragment
-	plan.ConnectTimeout = connectTimeout
-	return plan, nil
+// bypassParallel читает --bypass-parallel и держит значение в разумных рамках.
+func bypassParallel(cmd *cobra.Command) (int, error) {
+	n, err := cmd.Flags().GetInt("bypass-parallel")
+	if err != nil {
+		return 0, err
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 16 {
+		n = 16
+	}
+	return n, nil
 }
 
 // preferHTTP2 переставляет HTTP/2-кандидаты в начало списка, сохраняя порядок.
@@ -252,7 +360,9 @@ func preferHTTP2(in []api.TunnelCandidate) []api.TunnelCandidate {
 //     задан, перебираются ровно его значения (плюс sni, если -s указан явно).
 //     Так можно уйти от блокировки доменов Cloudflare;
 //   - иначе при явном -s используется только оно (перебор SNI отключается);
-//   - иначе первым идёт имя из конфига команды (sni), затем пул pool.
+//   - иначе первым идёт имя из конфига команды (sni), затем пул pool. Имена вне
+//     Cloudflare поднимаются в начало: сервер принимает любое имя, а ТСПУ режет
+//     домены Cloudflare по SNI.
 func bypassSNIs(sni string, sniChanged bool, extra []string, pool []string) []string {
 	if len(extra) > 0 {
 		if sniChanged && sni != "" {
@@ -263,7 +373,40 @@ func bypassSNIs(sni string, sniChanged bool, extra []string, pool []string) []st
 	if sniChanged && sni != "" {
 		return []string{sni}
 	}
-	return dedupeStrings(append([]string{sni}, pool...))
+	return orderSNIsForSweep(dedupeStrings(append([]string{sni}, pool...)))
+}
+
+// orderSNIsForSweep поднимает в начало имена вне Cloudflare, сохраняя
+// относительный порядок внутри групп. Сервер MASQUE принимает любое имя
+// (привязка идёт к публичному ключу), поэтому начинать с доменов Cloudflare,
+// которые ТСПУ режет по SNI, смысла нет.
+func orderSNIsForSweep(snis []string) []string {
+	neutral := make([]string, 0, len(snis))
+	cloudflare := make([]string, 0, len(snis))
+	for _, s := range snis {
+		if isCloudflareName(s) {
+			cloudflare = append(cloudflare, s)
+			continue
+		}
+		neutral = append(neutral, s)
+	}
+	return append(neutral, cloudflare...)
+}
+
+// isCloudflareName — грубая проверка, что имя принадлежит Cloudflare: ТСПУ
+// блокирует домены Cloudflare целиком, поэтому такие имена пробуем последними.
+func isCloudflareName(s string) bool {
+	s = strings.ToLower(strings.TrimSuffix(s, "."))
+	switch s {
+	case "one.one.one.one", "1.1.1.1":
+		return true
+	}
+	for _, suffix := range []string{"cloudflare.com", "cloudflareclient.com", "cloudflare-dns.com"} {
+		if strings.HasSuffix(s, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // l4Plan — итог разбора флагов L4-прокси: либо одно HTTP/3-подключение, либо
@@ -275,6 +418,7 @@ type l4Plan struct {
 	InitialPacketSize uint16
 	Candidates        []api.TunnelCandidate
 	CandidateTimeout  time.Duration
+	Parallel          int
 }
 
 // buildL4Plan строит план подключения для команд l4-socks и l4-http-proxy.
@@ -339,6 +483,11 @@ func buildL4Plan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *ecds
 		connectTimeout = defaultBypassConnectTimeout
 	}
 
+	parallel, err := bypassParallel(cmd)
+	if err != nil {
+		return plan, err
+	}
+
 	extraEndpoints, err := cmd.Flags().GetStringArray("bypass-endpoint")
 	if err != nil {
 		return plan, err
@@ -371,6 +520,7 @@ func buildL4Plan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *ecds
 	ports := dedupeInts(prependInt(connectPort, internal.BypassQUICPorts))
 
 	primarySNI := snis[0]
+	primaryIP := firstOrEmpty(ips)
 	var candidates []api.TunnelCandidate
 	seen := make(map[string]struct{})
 
@@ -399,22 +549,20 @@ func buildL4Plan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *ecds
 		})
 	}
 
-	// 1. Перебор портов на основном адресе (ловит резаный UDP/порт).
+	// Порядок «в ширину»: сначала пробуются все измерения (порт, SNI, адрес), а
+	// не исчерпывается одно. См. buildTunnelPlan.
 	for _, p := range ports {
-		add(primarySNI, ips[0], p)
+		add(primarySNI, primaryIP, p)
 	}
-	// 2. Перебор SNI на основном адресе (ловит блокировку по имени).
 	for _, s := range snis[1:] {
-		add(s, ips[0], 443)
+		add(s, primaryIP, 443)
 	}
-	// 3. Перебор адресов сервера (ловит блокировку по IP/подсети).
-	for _, ip := range ips[1:] {
-		add(primarySNI, ip, 443)
+	for i := 1; i < len(ips); i++ {
+		add(primarySNI, ips[i], 443)
 	}
-	// 4. Перебор пар «адрес × SNI».
 	for _, s := range snis[1:] {
-		for _, ip := range ips[1:] {
-			add(s, ip, 443)
+		for i := 1; i < len(ips); i++ {
+			add(s, ips[i], 443)
 		}
 	}
 
@@ -424,6 +572,7 @@ func buildL4Plan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *ecds
 
 	plan.Candidates = candidates
 	plan.CandidateTimeout = connectTimeout
+	plan.Parallel = parallel
 	return plan, nil
 }
 
@@ -462,6 +611,16 @@ func prependInt(first int, rest []int) []int {
 		return append([]int{}, rest...)
 	}
 	return append([]int{first}, rest...)
+}
+
+// firstOrEmpty возвращает первый элемент списка или пустую строку, если он пуст.
+// Список адресов может состоять только из записей, которые не разбираются как
+// IP, поэтому обращаться к элементам напрямую нельзя.
+func firstOrEmpty(in []string) string {
+	if len(in) == 0 {
+		return ""
+	}
+	return in[0]
 }
 
 // dedupeStrings убирает пустые значения и повторы, сохраняя порядок.

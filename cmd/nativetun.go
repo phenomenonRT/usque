@@ -210,6 +210,7 @@ var nativeTunCmd = &cobra.Command{
 				Candidates:        plan.Candidates,
 				Fragment:          plan.Fragment,
 				ConnectTimeout:    plan.ConnectTimeout,
+				Parallel:          plan.Parallel,
 				OnConnect:         onConnect,
 				OnDisconnect:      onDisconnect,
 				HookEnv:           hookEnv,

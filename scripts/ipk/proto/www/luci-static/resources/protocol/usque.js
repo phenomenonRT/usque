@@ -308,14 +308,14 @@ return network.registerProtocol('usque', {
 		o.optional = true;
 
 		o = s.taboption('general', form.Value, 'sni', _('SNI (имя в TLS-рукопожатии)'),
-			_('Пусто — usque в режиме обхода сам перебирает стандартное имя и запасные. Если задать своё, перебор SNI отключается и используется только оно.'));
+			_('Пусто — usque в режиме обхода сам перебирает имена: сначала вне Cloudflare, затем имена Cloudflare. Если задать своё, перебор SNI отключается и используется только оно.'));
+		o.value('www.microsoft.com', 'www.microsoft.com — вне Cloudflare, обход начинает с таких имён');
+		o.value('www.apple.com', 'www.apple.com — вне Cloudflare');
+		o.value('www.bing.com', 'www.bing.com — вне Cloudflare');
 		o.value('consumer-masque.cloudflareclient.com', 'consumer-masque.cloudflareclient.com — стандартный');
 		o.value('zt-masque.cloudflareclient.com', 'zt-masque.cloudflareclient.com — рекомендует автор usque');
 		o.value('www.cloudflare.com', 'www.cloudflare.com — обычный сайт');
 		o.value('one.one.one.one', 'one.one.one.one — обычный сайт');
-		o.value('www.microsoft.com', 'www.microsoft.com — вне Cloudflare');
-		o.value('www.apple.com', 'www.apple.com — вне Cloudflare');
-		o.value('www.bing.com', 'www.bing.com — вне Cloudflare');
 		o.placeholder = 'consumer-masque.cloudflareclient.com';
 		o.optional = true;
 

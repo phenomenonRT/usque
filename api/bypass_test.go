@@ -99,9 +99,142 @@ func TestTLSFragmentConfigEnabled(t *testing.T) {
 		t.Fatal("nil config must be disabled")
 	}
 	if (&TLSFragmentConfig{}).Enabled() {
-		t.Fatal("empty sizes must be disabled")
+		t.Fatal("zero config must be disabled")
 	}
 	if !DefaultTLSFragmentConfig().Enabled() {
 		t.Fatal("default config must be enabled")
+	}
+}
+
+// buildClientHello собирает минимальный, но корректный TLS ClientHello с одним
+// расширением server_name, чтобы проверить разбор и точки разрыва.
+func buildClientHello(sni string) []byte {
+	host := []byte(sni)
+	sn := make([]byte, 0, 5+len(host))
+	sn = append(sn, byte((len(host)+3)>>8), byte(len(host)+3)) // список имён
+	sn = append(sn, 0x00)                                      // host_name
+	sn = append(sn, byte(len(host)>>8), byte(len(host)))
+	sn = append(sn, host...)
+	ext := []byte{0x00, 0x00, byte(len(sn) >> 8), byte(len(sn))}
+	ext = append(ext, sn...)
+
+	body := []byte{0x03, 0x03}
+	body = append(body, make([]byte, 32)...)    // random
+	body = append(body, 0x00)                   // session_id
+	body = append(body, 0x00, 0x02, 0x13, 0x01) // cipher_suites
+	body = append(body, 0x01, 0x00)             // compression_methods
+	body = append(body, byte(len(ext)>>8), byte(len(ext)))
+	body = append(body, ext...)
+
+	hs := []byte{0x01, 0x00, byte(len(body) >> 8), byte(len(body))}
+	payload := append(hs, body...)
+	rec := []byte{0x16, 0x03, 0x01, byte(len(payload) >> 8), byte(len(payload))}
+	return append(rec, payload...)
+}
+
+func TestClientHelloSNI(t *testing.T) {
+	hello := buildClientHello("www.example.org")
+	start, end, ok := clientHelloSNI(hello)
+	if !ok {
+		t.Fatal("clientHelloSNI did not parse a valid ClientHello")
+	}
+	if got := string(hello[start:end]); got != "www.example.org" {
+		t.Fatalf("SNI = %q, want %q", got, "www.example.org")
+	}
+
+	if _, _, ok := clientHelloSNI(nil); ok {
+		t.Fatal("clientHelloSNI must reject an empty buffer")
+	}
+	if _, _, ok := clientHelloSNI(hello[:10]); ok {
+		t.Fatal("clientHelloSNI must reject a truncated ClientHello")
+	}
+	// No server_name extension at all.
+	noSNI := buildClientHello("")
+	if _, _, ok := clientHelloSNI(noSNI); ok {
+		t.Fatal("clientHelloSNI must report no SNI when the name is empty")
+	}
+}
+
+func TestFragmentConnSplitsInsideSNI(t *testing.T) {
+	rec := &recordConn{}
+	conn := wrapTLSFragment(rec, &TLSFragmentConfig{Auto: true})
+
+	hello := buildClientHello("www.microsoft.com")
+	start, end, ok := clientHelloSNI(hello)
+	if !ok {
+		t.Fatal("test ClientHello did not parse")
+	}
+
+	n, err := conn.Write(hello)
+	if err != nil || n != len(hello) {
+		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(hello))
+	}
+	if len(rec.segments) != 2 {
+		t.Fatalf("got %d segments, want 2", len(rec.segments))
+	}
+	boundary := len(rec.segments[0])
+	if boundary <= start || boundary >= end {
+		t.Fatalf("split at %d does not fall inside the SNI [%d, %d)", boundary, start, end)
+	}
+
+	var joined []byte
+	for _, s := range rec.segments {
+		joined = append(joined, s...)
+	}
+	if !bytes.Equal(joined, hello) {
+		t.Fatal("reassembled stream does not match the ClientHello")
+	}
+}
+
+func TestFragmentConnWaitsForWholeRecord(t *testing.T) {
+	rec := &recordConn{}
+	conn := wrapTLSFragment(rec, &TLSFragmentConfig{Auto: true})
+
+	hello := buildClientHello("example.org")
+	cut := len(hello) / 3
+	if _, err := conn.Write(hello[:cut]); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if len(rec.segments) != 0 {
+		t.Fatalf("wrote %d segments before the record was complete", len(rec.segments))
+	}
+	if _, err := conn.Write(hello[cut:]); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if len(rec.segments) != 2 {
+		t.Fatalf("got %d segments, want 2", len(rec.segments))
+	}
+}
+
+func TestFragmentConnAutoPassesThroughNonTLS(t *testing.T) {
+	rec := &recordConn{}
+	conn := wrapTLSFragment(rec, &TLSFragmentConfig{Auto: true})
+
+	first := []byte("GET / HTTP/1.1\r\n")
+	if _, err := conn.Write(first); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if len(rec.segments) != 1 || !bytes.Equal(rec.segments[0], first) {
+		t.Fatalf("got %q, want a single passthrough write", rec.segments)
+	}
+	if _, err := conn.Write([]byte("Host: example.org\r\n")); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if len(rec.segments) != 2 {
+		t.Fatalf("got %d segments, want 2 passthrough writes", len(rec.segments))
+	}
+}
+
+func TestFragmentConnAutoFallsBackWithoutSNI(t *testing.T) {
+	rec := &recordConn{}
+	conn := wrapTLSFragment(rec, &TLSFragmentConfig{Auto: true})
+
+	hello := buildClientHello("")
+	if _, err := conn.Write(hello); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(rec.segments) != 2 || len(rec.segments[0]) != 1 {
+		t.Fatalf("got %d segments (first %d bytes), want 2 with a 1-byte first segment",
+			len(rec.segments), len(rec.segments[0]))
 	}
 }

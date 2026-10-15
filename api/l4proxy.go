@@ -44,6 +44,9 @@ type L4ProxyConfig struct {
 	Candidates []TunnelCandidate
 	// CandidateTimeout bounds a single candidate attempt during rotation.
 	CandidateTimeout time.Duration
+	// Parallel keeps that many candidate attempts in flight at once. Values
+	// below two mean sequential attempts.
+	Parallel int
 }
 
 // L4Proxy opens one HTTP/3 CONNECT stream for each proxied TCP connection.
@@ -59,6 +62,7 @@ type L4Proxy struct {
 	connectRetryCount int
 	candidates        []TunnelCandidate
 	candidateTimeout  time.Duration
+	parallel          int
 	candidateIdx      atomic.Uint32
 	connMu            sync.Mutex
 	client            *l4HTTP3Client
@@ -109,6 +113,7 @@ func NewL4Proxy(cfg L4ProxyConfig) (*L4Proxy, error) {
 		connectRetryCount: cfg.ConnectRetryCount,
 		candidates:        cfg.Candidates,
 		candidateTimeout:  cfg.CandidateTimeout,
+		parallel:          cfg.Parallel,
 	}
 	proxy.dialFn = proxy.dial
 	return proxy, nil
@@ -281,67 +286,148 @@ func (p *L4Proxy) getOrCreateClientConn(ctx context.Context) (*l4HTTP3Client, er
 		return nil, fmt.Errorf("missing HTTP/3 UDP endpoint")
 	}
 
+	var (
+		newClient *l4HTTP3Client
+		err       error
+	)
+	if p.parallel > 1 && len(candidates) > 1 {
+		newClient, err = p.dialCandidatesParallel(ctx, candidates)
+	} else {
+		newClient, err = p.dialCandidatesSequential(ctx, candidates)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	p.connMu.Lock()
+	if p.client != nil {
+		current := p.client
+		p.connMu.Unlock()
+		closeL4HTTP3(newClient.udpConn, newClient.quicConn)
+		return current, nil
+	}
+	p.client = newClient
+	p.connMu.Unlock()
+
+	return newClient, nil
+}
+
+// dialCandidatesSequential walks the candidates round-robin, one at a time.
+func (p *L4Proxy) dialCandidatesSequential(ctx context.Context, candidates []TunnelCandidate) (*l4HTTP3Client, error) {
 	var lastErr error
 	for range candidates {
 		cand := candidates[p.nextCandidateIdx()%uint32(len(candidates))]
-		endpoint, ok := cand.Endpoint.(*net.UDPAddr)
-		if !ok || endpoint == nil {
-			lastErr = fmt.Errorf("candidate %q is not a UDP endpoint", cand.Label)
-			continue
-		}
-
-		attemptCtx := ctx
-		var cancel context.CancelFunc
-		if p.candidateTimeout > 0 {
-			attemptCtx, cancel = context.WithTimeout(ctx, p.candidateTimeout)
-		}
-
-		udpConn, err := listenUDPForEndpoint(endpoint)
+		client, err := p.tryCandidate(ctx, cand)
 		if err == nil {
-			// without ConnectionIDLength set, backend occasionally throws PROTOCOL_VIOLATION
-			// and that closes our connection
-			qtr := &quic.Transport{Conn: udpConn, ConnectionIDLength: 20}
-			var quicConn *quic.Conn
-			quicConn, err = qtr.Dial(attemptCtx, endpoint, cand.TLSConfig, p.quicConfig)
-			if err != nil {
-				_ = udpConn.Close()
-			} else {
-				if cancel != nil {
-					cancel()
-				}
-				newClient := &l4HTTP3Client{
-					udpConn:    udpConn,
-					quicConn:   quicConn,
-					clientConn: (&http3.Transport{}).NewClientConn(quicConn),
-				}
-
-				p.connMu.Lock()
-				if p.client != nil {
-					current := p.client
-					p.connMu.Unlock()
-					closeL4HTTP3(newClient.udpConn, newClient.quicConn)
-					return current, nil
-				}
-				p.client = newClient
-				p.connMu.Unlock()
-
-				return newClient, nil
-			}
+			return client, nil
 		}
-		if cancel != nil {
-			cancel()
-		}
-
 		lastErr = err
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 	}
-
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no connection candidates")
 	}
 	return nil, lastErr
+}
+
+// dialCandidatesParallel keeps p.parallel attempts in flight at once and stops
+// as soon as one connects.
+func (p *L4Proxy) dialCandidatesParallel(ctx context.Context, candidates []TunnelCandidate) (*l4HTTP3Client, error) {
+	type result struct {
+		client *l4HTTP3Client
+		err    error
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	limit := p.parallel
+	if limit > len(candidates) {
+		limit = len(candidates)
+	}
+
+	results := make(chan result, limit)
+	start := int(p.nextCandidateIdx())
+	launched, inFlight := 0, 0
+
+	launch := func() {
+		cand := candidates[(start+launched)%len(candidates)]
+		launched++
+		inFlight++
+		go func() {
+			client, err := p.tryCandidate(runCtx, cand)
+			results <- result{client: client, err: err}
+		}()
+	}
+
+	for inFlight < limit {
+		launch()
+	}
+
+	var lastErr error
+	for inFlight > 0 {
+		var res result
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res = <-results:
+		}
+		inFlight--
+
+		if res.client != nil {
+			cancel() // stop the attempts that are still running
+			return res.client, nil
+		}
+		lastErr = res.err
+		if launched < len(candidates) && ctx.Err() == nil {
+			launch()
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no connection candidates")
+	}
+	return nil, lastErr
+}
+
+// tryCandidate performs a single HTTP/3 connection attempt.
+func (p *L4Proxy) tryCandidate(ctx context.Context, cand TunnelCandidate) (*l4HTTP3Client, error) {
+	endpoint, ok := cand.Endpoint.(*net.UDPAddr)
+	if !ok || endpoint == nil {
+		return nil, fmt.Errorf("candidate %q is not a UDP endpoint", cand.Label)
+	}
+
+	attemptCtx := ctx
+	var cancel context.CancelFunc
+	if p.candidateTimeout > 0 {
+		attemptCtx, cancel = context.WithTimeout(ctx, p.candidateTimeout)
+	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
+
+	udpConn, err := listenUDPForEndpoint(endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// without ConnectionIDLength set, backend occasionally throws PROTOCOL_VIOLATION
+	// and that closes our connection
+	qtr := &quic.Transport{Conn: udpConn, ConnectionIDLength: 20}
+	quicConn, err := qtr.Dial(attemptCtx, endpoint, cand.TLSConfig, p.quicConfig)
+	if err != nil {
+		_ = udpConn.Close()
+		return nil, err
+	}
+
+	return &l4HTTP3Client{
+		udpConn:    udpConn,
+		quicConn:   quicConn,
+		clientConn: (&http3.Transport{}).NewClientConn(quicConn),
+	}, nil
 }
 
 func (p *L4Proxy) closeClientConnIfCurrent(expected *l4HTTP3Client) {

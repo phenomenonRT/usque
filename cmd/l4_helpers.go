@@ -138,6 +138,7 @@ func buildL4Proxy(cmd *cobra.Command, mode string) (l4ProxyOptions, *api.L4Proxy
 		Endpoint:         plan.Endpoint,
 		Candidates:       plan.Candidates,
 		CandidateTimeout: plan.CandidateTimeout,
+		Parallel:         plan.Parallel,
 		DNSResolver:      resolver,
 		ResolveLocally:   opts.localDNS,
 		OnConnect: func(target string) {

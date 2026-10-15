@@ -194,6 +194,10 @@ type MaintainTunnelConfig struct {
 	// ConnectTimeout bounds a single candidate attempt during rotation. Zero
 	// means no per-candidate timeout (the parent context still applies).
 	ConnectTimeout time.Duration
+	// Parallel keeps that many candidate attempts in flight at once. Values
+	// below two mean sequential attempts. Parallelism only helps when most
+	// attempts time out, which is exactly the case on a DPI-filtered network.
+	Parallel int
 	// OnConnect is a path to an executable run after every successful tunnel
 	// connect. It is exec'd directly (no shell, no args) and runs fire-and-forget.
 	OnConnect string
@@ -302,70 +306,144 @@ func tunnelCandidates(cfg MaintainTunnelConfig) []TunnelCandidate {
 // establishTunnel tries candidates round-robin starting at start until one
 // yields a 200 Connect-IP response. It returns the session and the index of the
 // winning candidate so the caller can prefer it on the next reconnect.
+//
+// With cfg.Parallel > 1, that many attempts stay in flight at once. On a
+// DPI-filtered network most candidates time out, so this cuts the time to find
+// a working combination by roughly that factor.
 func establishTunnel(ctx context.Context, cfg MaintainTunnelConfig, cands []TunnelCandidate, start int) (*tunnelSession, int, error) {
 	if len(cands) == 0 {
 		return nil, 0, errors.New("no connection candidates configured")
 	}
+	if cfg.Parallel > 1 && len(cands) > 1 {
+		return establishTunnelParallel(ctx, cfg, cands, start)
+	}
+	return establishTunnelSequential(ctx, cfg, cands, start)
+}
 
+// establishTunnelSequential tries one candidate at a time.
+func establishTunnelSequential(ctx context.Context, cfg MaintainTunnelConfig, cands []TunnelCandidate, start int) (*tunnelSession, int, error) {
 	var lastErr error
 	for i := 0; i < len(cands); i++ {
 		idx := (start + i) % len(cands)
-		cand := cands[idx]
-
-		attemptCtx := ctx
-		var cancel context.CancelFunc
-		if cfg.ConnectTimeout > 0 {
-			attemptCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
-		}
-
-		log.Printf("Establishing MASQUE connection to %s (%s)", cand.Endpoint, cand.Label)
-		udpConn, tr, ipConn, rsp, err := ConnectTunnel(
-			attemptCtx,
-			cand.TLSConfig,
-			internal.DefaultQuicConfig(cfg.KeepalivePeriod, cfg.InitialPacketSize),
-			internal.ConnectURI,
-			cand.Endpoint,
-			cand.UseHTTP2,
-			cfg.Fragment,
-		)
-		if cancel != nil {
-			cancel()
-		}
-
+		sess, err := tryCandidate(ctx, cfg, cands[idx])
 		if err != nil {
 			lastErr = err
-			log.Printf("Candidate %s failed: %v", cand.Label, err)
-			closePartialConnection(ipConn, tr, udpConn)
 			if ctx.Err() != nil {
 				return nil, idx, ctx.Err()
 			}
 			continue
 		}
+		return sess, idx, nil
+	}
+	return nil, start, lastErr
+}
 
-		if rsp == nil || rsp.StatusCode != http.StatusOK {
-			status := "no response"
-			if rsp != nil {
-				status = rsp.Status
-			}
-			lastErr = fmt.Errorf("candidate %s: unexpected status %s", cand.Label, status)
-			log.Printf("Candidate %s rejected: %s", cand.Label, status)
-			closePartialConnection(ipConn, tr, udpConn)
-			if ctx.Err() != nil {
-				return nil, idx, ctx.Err()
-			}
-			continue
-		}
-
-		return &tunnelSession{
-			candidate: cand,
-			udpConn:   udpConn,
-			transport: tr,
-			ipConn:    ipConn,
-			response:  rsp,
-		}, idx, nil
+// establishTunnelParallel keeps cfg.Parallel attempts in flight, walking the
+// candidates round-robin and stopping as soon as one connects.
+func establishTunnelParallel(ctx context.Context, cfg MaintainTunnelConfig, cands []TunnelCandidate, start int) (*tunnelSession, int, error) {
+	type attempt struct {
+		idx     int
+		session *tunnelSession
+		err     error
 	}
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// At most cfg.Parallel attempts run at once and a result is consumed before
+	// the next one starts, so this buffer never blocks a finished worker.
+	results := make(chan attempt, cfg.Parallel)
+	launched := 0
+	inFlight := 0
+
+	launch := func() {
+		idx := (start + launched) % len(cands)
+		cand := cands[idx]
+		launched++
+		inFlight++
+		go func() {
+			sess, err := tryCandidate(runCtx, cfg, cand)
+			results <- attempt{idx: idx, session: sess, err: err}
+		}()
+	}
+
+	for inFlight < cfg.Parallel && launched < len(cands) {
+		launch()
+	}
+
+	var lastErr error
+	for inFlight > 0 {
+		var res attempt
+		select {
+		case <-ctx.Done():
+			return nil, start, ctx.Err()
+		case res = <-results:
+		}
+		inFlight--
+
+		if res.err == nil {
+			cancel() // stop the attempts that are still running
+			return res.session, res.idx, nil
+		}
+		lastErr = res.err
+
+		if launched < len(cands) && ctx.Err() == nil {
+			launch()
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("no connection candidates succeeded")
+	}
 	return nil, start, lastErr
+}
+
+// tryCandidate performs a single connection attempt and returns a ready
+// session, or an error after closing whatever the attempt had opened.
+func tryCandidate(ctx context.Context, cfg MaintainTunnelConfig, cand TunnelCandidate) (*tunnelSession, error) {
+	attemptCtx := ctx
+	var cancel context.CancelFunc
+	if cfg.ConnectTimeout > 0 {
+		attemptCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
+	}
+
+	log.Printf("Establishing MASQUE connection to %s (%s)", cand.Endpoint, cand.Label)
+	udpConn, tr, ipConn, rsp, err := ConnectTunnel(
+		attemptCtx,
+		cand.TLSConfig,
+		internal.DefaultQuicConfig(cfg.KeepalivePeriod, cfg.InitialPacketSize),
+		internal.ConnectURI,
+		cand.Endpoint,
+		cand.UseHTTP2,
+		cfg.Fragment,
+	)
+	if cancel != nil {
+		cancel()
+	}
+
+	if err != nil {
+		log.Printf("Candidate %s failed: %v", cand.Label, err)
+		closePartialConnection(ipConn, tr, udpConn)
+		return nil, err
+	}
+
+	if rsp == nil || rsp.StatusCode != http.StatusOK {
+		status := "no response"
+		if rsp != nil {
+			status = rsp.Status
+		}
+		log.Printf("Candidate %s rejected: %s", cand.Label, status)
+		closePartialConnection(ipConn, tr, udpConn)
+		return nil, fmt.Errorf("candidate %s: unexpected status %s", cand.Label, status)
+	}
+
+	return &tunnelSession{
+		candidate: cand,
+		udpConn:   udpConn,
+		transport: tr,
+		ipConn:    ipConn,
+		response:  rsp,
+	}, nil
 }
 
 // closePartialConnection closes whatever transports a failed attempt created.

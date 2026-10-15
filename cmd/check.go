@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/Diniboy1123/usque/api"
@@ -97,58 +98,76 @@ var checkCmd = &cobra.Command{
 			timeout = 10 * time.Second
 		}
 
-		cmd.Printf("Проверка подключения: %d комбинаций, таймаут одной попытки %s\n", len(candidates), timeout)
+		parallel := plan.Parallel
+		if parallel < 1 {
+			parallel = 1
+		}
+		if parallel > len(candidates) {
+			parallel = len(candidates)
+		}
+
+		cmd.Printf("Проверка подключения: %d комбинаций, таймаут одной попытки %s, одновременно %d\n",
+			len(candidates), timeout, parallel)
 		if len(plan.Candidates) == 0 {
 			cmd.Println("(обход не включён — проверяется только текущий способ)")
 		}
 
+		type checkResult struct {
+			idx    int
+			reason string
+		}
+
+		runCtx, cancelAll := context.WithCancel(ctx)
+		defer cancelAll()
+
+		results := make(chan checkResult, parallel)
+		launched, inFlight := 0, 0
+		launch := func() {
+			idx := launched
+			cand := candidates[idx]
+			launched++
+			inFlight++
+			go func() {
+				results <- checkResult{
+					idx:    idx,
+					reason: checkCandidate(runCtx, cand, keepalivePeriod, plan.InitialPacketSize, plan.Fragment, timeout),
+				}
+			}()
+		}
+
+		for inFlight < parallel && launched < len(candidates) {
+			launch()
+		}
+
 		okCount := 0
 		firstOK := ""
-		for i, cand := range candidates {
-			attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-			udpConn, tr, ipConn, rsp, err := api.ConnectTunnel(
-				attemptCtx,
-				cand.TLSConfig,
-				internal.DefaultQuicConfig(keepalivePeriod, plan.InitialPacketSize),
-				internal.ConnectURI,
-				cand.Endpoint,
-				cand.UseHTTP2,
-				plan.Fragment,
-			)
-			cancel()
+		for inFlight > 0 {
+			var res checkResult
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case res = <-results:
+			}
+			inFlight--
 
-			var reason string
-			switch {
-			case err != nil:
-				reason = err.Error()
-			case rsp == nil:
-				reason = "нет ответа"
-			case rsp.StatusCode != 200:
-				reason = rsp.Status
-			}
-
-			if ipConn != nil {
-				_ = ipConn.Close()
-			}
-			if tr != nil {
-				_ = tr.Close()
-			}
-			if udpConn != nil {
-				_ = udpConn.Close()
-			}
-
-			if reason == "" {
+			cand := candidates[res.idx]
+			if res.reason == "" {
 				okCount++
 				if firstOK == "" {
 					firstOK = cand.Label
 				}
-				cmd.Printf("[%d/%d] OK   %s\n", i+1, len(candidates), cand.Label)
+				cmd.Printf("[%d/%d] OK   %s\n", res.idx+1, len(candidates), cand.Label)
 				if !testAll {
+					cancelAll() // останавливаем ещё идущие попытки
 					break
 				}
-				continue
+			} else {
+				cmd.Printf("[%d/%d] нет  %s — %s\n", res.idx+1, len(candidates), cand.Label, res.reason)
 			}
-			cmd.Printf("[%d/%d] нет  %s — %s\n", i+1, len(candidates), cand.Label, reason)
+
+			if launched < len(candidates) && ctx.Err() == nil {
+				launch()
+			}
 		}
 
 		if okCount == 0 {
@@ -158,6 +177,44 @@ var checkCmd = &cobra.Command{
 		cmd.Printf("Результат: работает %d из %d. Рабочая комбинация: %s\n", okCount, len(candidates), firstOK)
 		return nil
 	},
+}
+
+// checkCandidate выполняет одну попытку подключения к MASQUE и возвращает
+// пустую строку при успехе либо причину отказа.
+func checkCandidate(ctx context.Context, cand api.TunnelCandidate, keepalivePeriod time.Duration, initialPacketSize uint16, fragment *api.TLSFragmentConfig, timeout time.Duration) string {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	udpConn, tr, ipConn, rsp, err := api.ConnectTunnel(
+		attemptCtx,
+		cand.TLSConfig,
+		internal.DefaultQuicConfig(keepalivePeriod, initialPacketSize),
+		internal.ConnectURI,
+		cand.Endpoint,
+		cand.UseHTTP2,
+		fragment,
+	)
+
+	var reason string
+	switch {
+	case err != nil:
+		reason = err.Error()
+	case rsp == nil:
+		reason = "нет ответа"
+	case rsp.StatusCode != http.StatusOK:
+		reason = rsp.Status
+	}
+
+	if ipConn != nil {
+		_ = ipConn.Close()
+	}
+	if tr != nil {
+		_ = tr.Close()
+	}
+	if udpConn != nil {
+		_ = udpConn.Close()
+	}
+	return reason
 }
 
 func init() {
