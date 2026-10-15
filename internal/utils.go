@@ -132,6 +132,19 @@ func DefaultQuicConfig(keepalivePeriod time.Duration, initialPacketSize uint16) 
 		KeepAlivePeriod: keepalivePeriod,
 	}
 
+	// quic-go's default idle timeout is 30s, the same as the default keepalive
+	// period. The two then race: the connection is torn down just as a keepalive
+	// would have refreshed it, which surfaces as sporadic "no recent network
+	// activity" disconnects. Keep the idle timeout above the keepalive period so
+	// a keepalive always lands first.
+	if keepalivePeriod > 0 {
+		idle := 2 * keepalivePeriod
+		if idle < 30*time.Second {
+			idle = 30 * time.Second
+		}
+		cfg.MaxIdleTimeout = idle
+	}
+
 	if initialPacketSize > 0 {
 		cfg.InitialPacketSize = initialPacketSize
 		cfg.DisablePathMTUDiscovery = true

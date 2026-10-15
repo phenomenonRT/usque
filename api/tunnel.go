@@ -13,6 +13,7 @@ import (
 
 	connectip "github.com/Diniboy1123/connect-ip-go"
 	"github.com/Diniboy1123/usque/internal"
+	quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/songgao/water"
 	"golang.zx2c4.com/wireguard/tun"
@@ -509,13 +510,16 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			for {
 				packet, err := ipConn.ReadPacketZeroCopy(true)
 				if err != nil {
-					// In bypass mode the winning candidate picks the transport,
-					// which may differ from the command-level flag.
-					if session.candidate.UseHTTP2 {
-						errChan <- fmt.Errorf("connection closed while reading from IP connection: %w", err)
-						return
-					}
-					if errors.As(err, new(*connectip.CloseError)) {
+					// Any read error here means the stream is unusable: the
+					// transport may differ from the command-level flag in bypass
+					// mode, but either way the right move is to reconnect rather
+					// than spin on the same error. An idle timeout in particular
+					// used to be logged in a tight loop until the connection was
+					// finally closed.
+					if session.candidate.UseHTTP2 ||
+						errors.As(err, new(*connectip.CloseError)) ||
+						errors.As(err, new(*quic.IdleTimeoutError)) ||
+						errors.Is(err, net.ErrClosed) {
 						errChan <- fmt.Errorf("connection closed while reading from IP connection: %w", err)
 						return
 					}
