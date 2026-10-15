@@ -64,6 +64,7 @@ do_info() {
 	local iface cfg exists=0 running=0 up=0 netifd_up=0
 	local mode port endpoint sni profile log
 	local check check_running=0 cpid
+	local bypass bypass_saved remember state
 
 	iface="$(arg iface)"
 	cfg="$(arg config)"
@@ -86,10 +87,26 @@ do_info() {
 	[ -n "$cpid" ] && [ -d "/proc/$cpid" ] && check_running=1
 	check="$(tail -n 40 "$STATE/$iface.check" 2>/dev/null | jlines)"
 
+	# С каким набором реально поднялся обход: до подключения известно только
+	# «bypass», а удачную комбинацию usque печатает в журнал сам.
+	bypass="$(sed -n 's/^.*Connected to MASQUE server via //p' "$STATE/$iface.log" 2>/dev/null | tail -n 1)"
+
+	# Комбинация, запомненная для следующего запуска: её пробуют первой.
+	bypass_saved=""
+	remember="$(uci_get "network.$iface.bypass_remember")"
+	if [ -z "$remember" ] || [ "$remember" = 1 ]; then
+		case "$cfg" in
+		/*) state="$(dirname "$cfg")/$iface.bypass" ;;
+		*) state="$STATE/$iface.bypass" ;;
+		esac
+		[ -r "$state" ] && bypass_saved="$(head -n 1 "$state" 2>/dev/null)"
+	fi
+
 	printf '{"ok":true,"config_exists":%s,"running":%s,"up":%s,"netifd_up":%s,' \
 		"$(jbool $exists)" "$(jbool $running)" "$(jbool $up)" "$(jbool $netifd_up)"
 	printf '"mode":"%s","port":"%s","endpoint":"%s","sni":"%s","profile":"%s",' \
 		"$(jesc "$mode")" "$(jesc "$port")" "$(jesc "$endpoint")" "$(jesc "$sni")" "$(jesc "$profile")"
+	printf '"bypass":"%s","bypass_saved":"%s",' "$(jesc "$bypass")" "$(jesc "$bypass_saved")"
 	if [ "$exists" = 1 ]; then
 		printf '"endpoint_v4":"%s","endpoint_v6":"%s","endpoint_h2_v4":"%s","endpoint_h2_v6":"%s","ipv4":"%s","ipv6":"%s",' \
 			"$(jesc "$(cfgval "$cfg" endpoint_v4)")" "$(jesc "$(cfgval "$cfg" endpoint_v6)")" \
@@ -151,9 +168,9 @@ do_restart() {
 # вывод пишем в $STATE/<iface>.check, статус читается в do_info. Кнопка в LuCI
 # лишь запускает проверку, а результат подхватывает обычный опрос панели.
 do_check() {
-	local iface cfg profile connect_port sni ipv6 http2 bypass bypass_sni
+	local iface cfg profile connect_port sni ipv6 http2 bypass bypass_sni bypass_remember
 	local initial_packet_size insecure connect_timeout args endpoint endpoint_h2
-	local use_bypass p s pid pidfile
+	local use_bypass p s pid pidfile bypass_state
 
 	iface="$(arg iface)"
 	valid_iface "$iface" || { reply_err BAD_IFACE; return; }
@@ -171,6 +188,7 @@ do_check() {
 	http2="$(uci_get "network.$iface.http2")"
 	bypass="$(uci_get "network.$iface.bypass")"
 	bypass_sni="$(uci_get "network.$iface.bypass_sni")"
+	bypass_remember="$(uci_get "network.$iface.bypass_remember")"
 	initial_packet_size="$(uci_get "network.$iface.initial_packet_size")"
 	insecure="$(uci_get "network.$iface.insecure")"
 	connect_timeout="$(uci_get "network.$iface.connect_timeout")"
@@ -182,11 +200,22 @@ do_check() {
 	case "$profile" in auto) use_bypass=1 ;; esac
 	[ "$bypass" = 1 ] && use_bypass=1
 
+	# Тот же файл запомненной комбинации, что и у самого подключения: если она
+	# есть, проверка начнётся с неё (заодно видно, что она ещё рабочая).
+	bypass_state="-"
+	if [ "$bypass_remember" != 0 ]; then
+		bypass_state="$(dirname "$cfg")/$iface.bypass"
+		case "$bypass_state" in
+		/*) ;;
+		*) bypass_state="/etc/usque/$iface.bypass" ;;
+		esac
+	fi
+
 	p="${connect_port:-443}"
 	set -- -c "$cfg" check -P "$p"
 	[ "$ipv6" = 1 ] && set -- "$@" -6
 	if [ "$use_bypass" = 1 ]; then
-		set -- "$@" --bypass
+		set -- "$@" --bypass --bypass-state "$bypass_state"
 		[ -n "$endpoint" ] && set -- "$@" --bypass-endpoint "$endpoint"
 		[ -n "$endpoint_h2" ] && set -- "$@" --bypass-endpoint "$endpoint_h2"
 		if [ -n "$bypass_sni" ]; then

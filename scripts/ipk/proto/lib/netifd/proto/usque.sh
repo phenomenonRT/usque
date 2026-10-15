@@ -60,6 +60,7 @@ proto_usque_init_config() {
 	proto_config_add_int "connect_timeout"
 	proto_config_add_boolean "bypass"
 	proto_config_add_string "bypass_sni"
+	proto_config_add_boolean "bypass_remember"
 	proto_config_add_string "args"
 }
 
@@ -204,12 +205,12 @@ proto_usque_setup() {
 	local interface="$1"
 	local config profile endpoint endpoint_h2 defaultroute metric mtu connect_port sni http2 ipv6
 	local tunnel_ipv4 tunnel_ipv6 keepalive reconnect_delay initial_packet_size
-	local insecure connect_timeout bypass bypass_sni args
-	local ifname cfg use_bypass cands c m p ep ep_h2 tmo i pid
+	local insecure connect_timeout bypass bypass_sni bypass_remember args
+	local ifname cfg use_bypass cands c m p ep ep_h2 tmo i pid bypass_state
 
 	json_get_vars config profile endpoint endpoint_h2 defaultroute metric mtu connect_port sni \
 		http2 ipv6 tunnel_ipv4 tunnel_ipv6 keepalive reconnect_delay initial_packet_size \
-		insecure connect_timeout bypass bypass_sni args
+		insecure connect_timeout bypass bypass_sni bypass_remember args
 
 	[ -n "$config" ] || config=/etc/usque/config.json
 	[ -n "$profile" ] || profile=auto
@@ -217,6 +218,19 @@ proto_usque_setup() {
 	[ -n "$mtu" ] || mtu=1280
 	[ -n "$tunnel_ipv4" ] || tunnel_ipv4=1
 	[ -n "$tunnel_ipv6" ] || tunnel_ipv6=1
+	[ -n "$bypass_remember" ] || bypass_remember=1
+
+	# Файл, в котором usque запоминает удачную комбинацию обхода: следующее
+	# подключение начинается с неё. Лежит рядом с config.json, чтобы пережить
+	# перезагрузку; галочка «Запоминать» заменяет путь на «-» (не запоминать).
+	bypass_state="-"
+	if [ "$bypass_remember" != 0 ]; then
+		bypass_state="$(dirname "$config")/$interface.bypass"
+		case "$bypass_state" in
+		/*) ;;
+		*) bypass_state="/etc/usque/$interface.bypass" ;;
+		esac
+	fi
 
 	# «Авто» всегда включает клиентский обход ТСПУ; опция bypass=1 включает его и
 	# для явных способов quic/h2/manual.
@@ -305,6 +319,8 @@ proto_usque_setup() {
 		set -- -c "$cfg" nativetun -n "$ifname" -I -m "$mtu" -P "$p" --always-reconnect
 		if [ "$use_bypass" = 1 ]; then
 			set -- "$@" --bypass
+			# Запоминание рабочей комбинации между запусками (галочка в LuCI).
+			set -- "$@" --bypass-state "$bypass_state"
 			# Свой список SNI (пробел или запятая) полностью заменяет
 			# встроенный — пригодится, когда домены Cloudflare блокируют.
 			if [ -n "$bypass_sni" ]; then

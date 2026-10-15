@@ -121,6 +121,11 @@ function statusBox(sid) {
 			kids.push(row('Сервер (QUIC, UDP):', ep + ' — из config.json'));
 			kids.push(row('Сервер (HTTP/2, TCP):', h2 + ' — из config.json'));
 		}
+		/* чем именно поднялся обход: комбинация, подобранная перебором */
+		if (info.bypass)
+			kids.push(row('Обход ТСПУ идёт через:', info.bypass));
+		if (info.bypass_saved)
+			kids.push(row('Запомнено для следующего запуска:', info.bypass_saved));
 		if (info.config_exists && (info.ipv4 || info.ipv6))
 			kids.push(row('Адрес в тоннеле:', [ info.ipv4, info.ipv6 ].filter(Boolean).join(', ')));
 
@@ -393,6 +398,11 @@ return network.registerProtocol('usque', {
 		o.depends('profile', 'quic');
 		o.depends('profile', 'h2');
 		o.depends('profile', 'manual');
+
+		o = s.taboption('advanced', form.Flag, 'bypass_remember', _('Запоминать рабочую комбинацию обхода'),
+			_('Удачная комбинация (адрес, порт, SNI, транспорт) сохраняется рядом с config.json, и следующее подключение начинается сразу с неё, без перебора. Работает в режиме обхода ТСПУ, в том числе после перезагрузки роутера.'));
+		o.default = o.enabled;
+		o.rmempty = false;
 
 		o = s.taboption('advanced', form.Value, 'bypass_sni', _('Свои SNI для обхода'),
 			_('Имена через пробел или запятую. Полностью заменяют встроенный список SNI. Нужны, когда провайдер блокирует домены Cloudflare по имени: сертификат сервера проверяется по ключу, поэтому подойдёт любое незаблокированное имя.'));
