@@ -296,7 +296,12 @@ proto_usque_setup() {
 		printf 'mode=%s\nport=%s\nendpoint=%s\nsni=%s\nprofile=%s\n' \
 			"$m" "$p" "$ep" "${sni:-$USQUE_DEFAULT_SNI}" "$profile" > "$USQUE_STATE/$interface.cur"
 
-		set -- -c "$cfg" nativetun -n "$ifname" -I -m "$mtu" -P "$p"
+		# --always-reconnect обязателен: с -I usque не поднимает линк и не
+		# ставит адреса, поэтому ядро не шлёт RS/DAD, которые иначе разбудили
+		# бы тоннель. Адреса и маршруты ставит хук уже после подключения, так
+		# что без этого флага первое подключение ждало бы трафик, которого до
+		# подключения быть не может.
+		set -- -c "$cfg" nativetun -n "$ifname" -I -m "$mtu" -P "$p" --always-reconnect
 		[ "$use_bypass" = 1 ] && set -- "$@" --bypass
 		[ "$m" = h2 ] && set -- "$@" --http2
 		[ -n "$sni" ] && set -- "$@" -s "$sni"
