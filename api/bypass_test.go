@@ -43,9 +43,7 @@ func TestFragmentConnSplitsFirstWrites(t *testing.T) {
 	}
 
 	var got [][]byte
-	for _, seg := range rec.segments {
-		got = append(got, seg)
-	}
+	got = append(got, rec.segments...)
 	want := [][]byte{[]byte("h"), []byte("el"), []byte("lo world")}
 	if len(got) != len(want) {
 		t.Fatalf("got %d segments %q, want %d", len(got), got, len(want))

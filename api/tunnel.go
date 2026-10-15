@@ -280,22 +280,6 @@ type tunnelSession struct {
 	response  *http.Response
 }
 
-// close releases every transport owned by the session.
-func (s *tunnelSession) close() {
-	if s == nil {
-		return
-	}
-	if s.ipConn != nil {
-		_ = s.ipConn.Close()
-	}
-	if s.transport != nil {
-		_ = s.transport.Close()
-	}
-	if s.udpConn != nil {
-		_ = s.udpConn.Close()
-	}
-}
-
 // tunnelCandidates returns the effective candidate list. When no bypass
 // candidates were configured, the single TLSConfig/Endpoint pair is used.
 func tunnelCandidates(cfg MaintainTunnelConfig) []TunnelCandidate {
