@@ -343,33 +343,52 @@ func (p *L4Proxy) dialCandidatesSequential(ctx context.Context, candidates []Tun
 	return nil, lastErr
 }
 
+// l4Attempt — результат одной попытки в параллельном переборе L4-прокси.
+type l4Attempt struct {
+	client *l4HTTP3Client
+	err    error
+}
+
+// drainLateL4Clients closes L4-клиенты, которые подключились уже после выбора
+// победителя: иначе такой клиент останется висеть вместе с сокетом.
+func drainLateL4Clients(results <-chan l4Attempt, n int) {
+	for i := 0; i < n; i++ {
+		if c := (<-results).client; c != nil {
+			closeL4HTTP3(c.udpConn, c.quicConn)
+		}
+	}
+}
+
 // dialCandidatesParallel keeps p.parallel attempts in flight at once and stops
 // as soon as one connects.
 func (p *L4Proxy) dialCandidatesParallel(ctx context.Context, candidates []TunnelCandidate) (*l4HTTP3Client, error) {
-	type result struct {
-		client *l4HTTP3Client
-		err    error
-	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	limit := p.parallel
 	if limit > len(candidates) {
 		limit = len(candidates)
 	}
 
-	results := make(chan result, limit)
+	results := make(chan l4Attempt, limit)
 	start := int(p.nextCandidateIdx())
 	launched, inFlight := 0, 0
+
+	// Отменяется каждая попытка своим контекстом: общий отменил бы и
+	// победителя вместе с остальными (см. комментарий в establishTunnelParallel).
+	var cancelAttempts []context.CancelFunc
+	defer func() {
+		for _, cancel := range cancelAttempts {
+			cancel()
+		}
+	}()
 
 	launch := func() {
 		cand := candidates[(start+launched)%len(candidates)]
 		launched++
 		inFlight++
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		cancelAttempts = append(cancelAttempts, cancelAttempt)
 		go func() {
-			client, err := p.tryCandidate(runCtx, cand)
-			results <- result{client: client, err: err}
+			client, err := p.tryCandidate(attemptCtx, cand)
+			results <- l4Attempt{client: client, err: err}
 		}()
 	}
 
@@ -379,7 +398,7 @@ func (p *L4Proxy) dialCandidatesParallel(ctx context.Context, candidates []Tunne
 
 	var lastErr error
 	for inFlight > 0 {
-		var res result
+		var res l4Attempt
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -388,7 +407,9 @@ func (p *L4Proxy) dialCandidatesParallel(ctx context.Context, candidates []Tunne
 		inFlight--
 
 		if res.client != nil {
-			cancel() // stop the attempts that are still running
+			if inFlight > 0 {
+				go drainLateL4Clients(results, inFlight)
+			}
 			return res.client, nil
 		}
 		lastErr = res.err
@@ -414,6 +435,9 @@ func (p *L4Proxy) tryCandidate(ctx context.Context, cand TunnelCandidate) (*l4HT
 	if p.candidateTimeout > 0 {
 		attemptCtx, cancel = context.WithTimeout(ctx, p.candidateTimeout)
 	}
+	// Отмена этого контекста после успешного рукопожатия безопасна: quic-go
+	// отвязывает соединение от контекста Dial (context.WithoutCancel), поэтому
+	// победитель перебора продолжает жить.
 	defer func() {
 		if cancel != nil {
 			cancel()

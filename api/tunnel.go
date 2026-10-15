@@ -334,7 +334,7 @@ func establishTunnelSequential(ctx context.Context, cfg MaintainTunnelConfig, ca
 	var lastErr error
 	for i := 0; i < len(cands); i++ {
 		idx := (start + i) % len(cands)
-		sess, err := tryCandidate(ctx, cfg, cands[idx])
+		sess, err := tryCandidate(ctx, nil, cfg, cands[idx])
 		if err != nil {
 			lastErr = err
 			if ctx.Err() != nil {
@@ -347,32 +347,43 @@ func establishTunnelSequential(ctx context.Context, cfg MaintainTunnelConfig, ca
 	return nil, start, lastErr
 }
 
+// tunnelAttempt — результат одной попытки в параллельном переборе.
+type tunnelAttempt struct {
+	idx     int
+	session *tunnelSession
+	err     error
+}
+
 // establishTunnelParallel keeps cfg.Parallel attempts in flight, walking the
 // candidates round-robin and stopping as soon as one connects.
 func establishTunnelParallel(ctx context.Context, cfg MaintainTunnelConfig, cands []TunnelCandidate, start int) (*tunnelSession, int, error) {
-	type attempt struct {
-		idx     int
-		session *tunnelSession
-		err     error
-	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	// At most cfg.Parallel attempts run at once and a result is consumed before
 	// the next one starts, so this buffer never blocks a finished worker.
-	results := make(chan attempt, cfg.Parallel)
+	results := make(chan tunnelAttempt, cfg.Parallel)
 	launched := 0
 	inFlight := 0
+
+	// У каждой попытки свой контекст отмены: общий отменил бы и победителя,
+	// потому что установленное соединение остаётся привязанным к контексту,
+	// с которым его создали (поток HTTP/2 CONNECT). Временем жизни туннеля
+	// служит ctx, а попытки прерываются их собственными контекстами.
+	var cancelAttempts []context.CancelFunc
+	defer func() {
+		for _, cancel := range cancelAttempts {
+			cancel()
+		}
+	}()
 
 	launch := func() {
 		idx := (start + launched) % len(cands)
 		cand := cands[idx]
 		launched++
 		inFlight++
+		dialCtx, cancelAttempt := context.WithCancel(ctx)
+		cancelAttempts = append(cancelAttempts, cancelAttempt)
 		go func() {
-			sess, err := tryCandidate(runCtx, cfg, cand)
-			results <- attempt{idx: idx, session: sess, err: err}
+			sess, err := tryCandidate(ctx, dialCtx, cfg, cand)
+			results <- tunnelAttempt{idx: idx, session: sess, err: err}
 		}()
 	}
 
@@ -382,7 +393,7 @@ func establishTunnelParallel(ctx context.Context, cfg MaintainTunnelConfig, cand
 
 	var lastErr error
 	for inFlight > 0 {
-		var res attempt
+		var res tunnelAttempt
 		select {
 		case <-ctx.Done():
 			return nil, start, ctx.Err()
@@ -391,7 +402,12 @@ func establishTunnelParallel(ctx context.Context, cfg MaintainTunnelConfig, cand
 		inFlight--
 
 		if res.err == nil {
-			cancel() // stop the attempts that are still running
+			// Остальные попытки прерываются отложенными cancel'ами, но две
+			// могли успеть подключиться одновременно: тогда позднюю сессию
+			// нужно закрыть, иначе она останется висеть в фоне.
+			if inFlight > 0 {
+				go drainLateAttempts(results, inFlight)
+			}
 			return res.session, res.idx, nil
 		}
 		lastErr = res.err
@@ -407,13 +423,52 @@ func establishTunnelParallel(ctx context.Context, cfg MaintainTunnelConfig, cand
 	return nil, start, lastErr
 }
 
+// drainLateAttempts closes sessions that finished establishing after a winner
+// was already picked.
+func drainLateAttempts(results <-chan tunnelAttempt, n int) {
+	for i := 0; i < n; i++ {
+		closeTunnelSession((<-results).session)
+	}
+}
+
+// closeTunnelSession closes a session nobody is going to use.
+func closeTunnelSession(sess *tunnelSession) {
+	if sess == nil {
+		return
+	}
+	if sess.ipConn != nil {
+		_ = sess.ipConn.Close()
+	}
+	if sess.transport != nil {
+		_ = sess.transport.Close()
+	}
+	if sess.udpConn != nil {
+		_ = sess.udpConn.Close()
+	}
+}
+
+// connectCandidate — ConnectTunnel через переменную: тесты подменяют её, чтобы
+// проверить, какие контексты получает попытка, не выходя в сеть.
+var connectCandidate = ConnectTunnel
+
 // tryCandidate performs a single connection attempt and returns a ready
 // session, or an error after closing whatever the attempt had opened.
-func tryCandidate(ctx context.Context, cfg MaintainTunnelConfig, cand TunnelCandidate) (*tunnelSession, error) {
-	attemptCtx := ctx
-	var cancel context.CancelFunc
+//
+// lifetimeCtx — контекст самого туннеля: установленное соединение остаётся к
+// нему привязанным (поток HTTP/2 CONNECT живёт столько же, сколько контекст
+// запроса), поэтому отменять его, пока туннель нужен, нельзя. dialCtx прерывает
+// только установку; при dialCtx == nil он выводится из lifetimeCtx и
+// cfg.ConnectTimeout.
+func tryCandidate(lifetimeCtx context.Context, dialCtx context.Context, cfg MaintainTunnelConfig, cand TunnelCandidate) (*tunnelSession, error) {
+	if dialCtx == nil {
+		dialCtx = lifetimeCtx
+	}
 	if cfg.ConnectTimeout > 0 {
-		attemptCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
+		// Таймаут попытки — поверх переданного контекста: cancel() после
+		// успеха безопасен, потому что aborter уже отключён внутри ConnectTunnel.
+		var cancel context.CancelFunc
+		dialCtx, cancel = context.WithTimeout(dialCtx, cfg.ConnectTimeout)
+		defer cancel()
 	}
 
 	initialPacketSize := cfg.InitialPacketSize
@@ -426,10 +481,11 @@ func tryCandidate(ctx context.Context, cfg MaintainTunnelConfig, cand TunnelCand
 	if cand.LocalPort > 0 && !cand.UseHTTP2 {
 		opts = append(opts, WithLocalUDPPort(cand.LocalPort))
 	}
+	opts = append(opts, WithDialCancel(dialCtx))
 
 	log.Printf("Establishing MASQUE connection to %s (%s)", cand.Endpoint, cand.Label)
-	udpConn, tr, ipConn, rsp, err := ConnectTunnel(
-		attemptCtx,
+	udpConn, tr, ipConn, rsp, err := connectCandidate(
+		lifetimeCtx,
 		cand.TLSConfig,
 		internal.DefaultQuicConfig(cfg.KeepalivePeriod, initialPacketSize),
 		internal.ConnectURI,
@@ -438,11 +494,15 @@ func tryCandidate(ctx context.Context, cfg MaintainTunnelConfig, cand TunnelCand
 		cfg.Fragment,
 		opts...,
 	)
-	if cancel != nil {
-		cancel()
-	}
 
 	if err != nil {
+		if dialCtx.Err() != nil {
+			// Попытку прервали: истёк таймаут или другой кандидат подключился
+			// первым. Это не отказ сети, и в журнале это должно быть видно.
+			log.Printf("Candidate %s aborted: %v", cand.Label, dialCtx.Err())
+			closePartialConnection(ipConn, tr, udpConn)
+			return nil, fmt.Errorf("candidate %s: %w", cand.Label, dialCtx.Err())
+		}
 		log.Printf("Candidate %s failed: %v", cand.Label, err)
 		closePartialConnection(ipConn, tr, udpConn)
 		return nil, err

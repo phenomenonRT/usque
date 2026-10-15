@@ -7,10 +7,12 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	connectip "github.com/Diniboy1123/connect-ip-go"
 	"github.com/quic-go/quic-go"
@@ -92,6 +94,11 @@ func PrepareTlsConfig(privKey *ecdsa.PrivateKey, peerPubKey *ecdsa.PublicKey, ce
 // When useHTTP2 is false it dials over QUIC/HTTP3; when true it dials over TCP/HTTP2.
 // Requires modified connect-ip-go for now to support Cloudflare's non RFC compliant implementation.
 //
+// ctx is the lifetime of the tunnel, not just of the dial: with HTTP/2 the
+// CONNECT stream is bound to it, so cancelling ctx after a successful dial
+// tears the tunnel down. Use WithDialCancel for a context that only aborts the
+// establishment.
+//
 // Parameters:
 //   - ctx: context.Context - The connection context.
 //   - tlsConfig: *tls.Config - The TLS configuration for secure communication.
@@ -114,6 +121,7 @@ type ConnectOption func(*connectOptions)
 // connectOptions — необязательные параметры одной попытки.
 type connectOptions struct {
 	localPort int
+	dialCtx   context.Context
 }
 
 // WithLocalUDPPort задаёт порт источника для QUIC-сокета (0 — системный).
@@ -122,6 +130,94 @@ type connectOptions struct {
 func WithLocalUDPPort(port int) ConnectOption {
 	return func(o *connectOptions) {
 		o.localPort = port
+	}
+}
+
+// WithDialCancel задаёт контекст, отмена которого прерывает только установку
+// соединения: уже поднятый туннель от него не зависит (см. dialAborter).
+// Основной контекст ConnectTunnel — это время жизни соединения, и отменять его
+// нельзя: connect-ip привязывает поток HTTP/2 CONNECT к контексту запроса.
+func WithDialCancel(ctx context.Context) ConnectOption {
+	return func(o *connectOptions) {
+		o.dialCtx = ctx
+	}
+}
+
+// dialAborter аварийно закрывает ресурсы незавершённой установки соединения,
+// когда её прерывают (таймаут попытки или победа другого кандидата).
+//
+// Нужен потому, что один контекст не может одновременно и прерывать установку,
+// и служить временем жизни соединения: у HTTP/2 CONNECT поток живёт ровно
+// столько, сколько живёт контекст его запроса. Поэтому попытка передаёт
+// connect-ip долгоживущий контекст, а прерывание установки делает через
+// закрытие сокета; после успеха aborter отключается (disarm), и отмена
+// больше не трогает поднятое соединение.
+type dialAborter struct {
+	mu      sync.Mutex
+	stop    func() bool
+	closers []io.Closer
+	aborted bool
+	done    bool
+}
+
+// newDialAborter ставит закрытие на отмену ctx. nil-контекст даёт nil-aborter,
+// у которого все методы — no-op.
+func newDialAborter(ctx context.Context) *dialAborter {
+	if ctx == nil {
+		return nil
+	}
+	a := &dialAborter{}
+	a.stop = context.AfterFunc(ctx, a.abort)
+	return a
+}
+
+// track регистрирует ресурс, который надо закрыть при прерывании.
+func (a *dialAborter) track(c io.Closer) {
+	if a == nil || c == nil {
+		return
+	}
+	a.mu.Lock()
+	aborted, done := a.aborted, a.done
+	if !aborted && !done {
+		a.closers = append(a.closers, c)
+	}
+	a.mu.Unlock()
+
+	if aborted {
+		_ = c.Close()
+	}
+}
+
+// disarm отключает aborter: соединение поднялось, и отмена больше не должна
+// его трогать. Возвращает true, если прерывание всё же успело сработать —
+// тогда полученное соединение уже закрыто и использовать его нельзя.
+func (a *dialAborter) disarm() bool {
+	if a == nil {
+		return false
+	}
+	stopped := true
+	if a.stop != nil {
+		stopped = a.stop()
+	}
+
+	a.mu.Lock()
+	aborted := a.aborted
+	a.done = true
+	a.closers = nil
+	a.mu.Unlock()
+
+	return aborted || !stopped
+}
+
+func (a *dialAborter) abort() {
+	a.mu.Lock()
+	a.aborted = true
+	closers := a.closers
+	a.closers = nil
+	a.mu.Unlock()
+
+	for _, c := range closers {
+		_ = c.Close()
 	}
 }
 
@@ -142,6 +238,9 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 		"User-Agent": []string{""},
 	}
 	options := applyConnectOptions(opts)
+	// Прерывание установки — отдельный механизм: отмена ctx означала бы
+	// закрытие уже поднятого туннеля (см. dialAborter).
+	abort := newDialAborter(options.dialCtx)
 
 	if useHTTP2 {
 		h2Endpoint, ok := endpoint.(*net.TCPAddr)
@@ -154,7 +253,7 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 		// TODO: support PQC
 		h2Headers.Set("pq-enabled", "false")
 
-		h2Client, err := newHTTP2Client(tlsConfig, h2Endpoint, connectUri, fragment)
+		h2Client, err := newHTTP2Client(tlsConfig, h2Endpoint, connectUri, fragment, abort)
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("failed to create HTTP/2 client: %w", err)
 		}
@@ -166,6 +265,10 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 			}
 			return nil, nil, nil, nil, fmt.Errorf("failed to dial connect-ip over HTTP/2: %w", err)
 		}
+		if abort.disarm() {
+			_ = ipConn.Close()
+			return nil, nil, nil, nil, errors.New("connect attempt aborted")
+		}
 		return nil, nil, ipConn, rsp, nil
 	}
 
@@ -176,8 +279,12 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		udpConn, tr, ipConn, rsp, err := connectTunnelHTTP3(ctx, tlsConfig, quicConfig, template, additionalHeaders, quicEndpoint, options.localPort)
+		udpConn, tr, ipConn, rsp, err := connectTunnelHTTP3(ctx, tlsConfig, quicConfig, template, additionalHeaders, quicEndpoint, options.localPort, abort)
 		if err == nil {
+			if abort.disarm() {
+				closePartialConnection(ipConn, tr, udpConn)
+				return nil, nil, nil, nil, errors.New("connect attempt aborted")
+			}
 			return udpConn, tr, ipConn, rsp, nil
 		}
 		if strings.Contains(err.Error(), "tls: access denied") {
@@ -191,7 +298,7 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 	return nil, nil, nil, nil, fmt.Errorf("failed to dial connect-ip: %w", lastErr)
 }
 
-func connectTunnelHTTP3(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, template *uritemplate.Template, additionalHeaders http.Header, endpoint *net.UDPAddr, localPort int) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+func connectTunnelHTTP3(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, template *uritemplate.Template, additionalHeaders http.Header, endpoint *net.UDPAddr, localPort int, abort *dialAborter) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
 	var udpConn *net.UDPConn
 	var err error
 	if endpoint.IP.To4() == nil {
@@ -208,6 +315,9 @@ func connectTunnelHTTP3(ctx context.Context, tlsConfig *tls.Config, quicConfig *
 	if err != nil {
 		return udpConn, nil, nil, nil, err
 	}
+	// Закрытие сокета прерывает и рукопожатие, и ожидание ответа: QUIC-соединение
+	// живёт на этом сокете.
+	abort.track(udpConn)
 
 	// without ConnectionIDLength set, backend occasionally throws PROTOCOL_VIOLATION
 	// and that closes our connection
@@ -255,7 +365,7 @@ func isRetryableHTTP3ConnectFailure(err error) bool {
 // It honors proxy environment variables and pins dialing to the selected endpoint.
 // When fragment is enabled, the raw TCP connection is wrapped so the TLS
 // ClientHello leaves in multiple TCP segments (DPI bypass).
-func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI string, fragment *TLSFragmentConfig) (*http.Client, error) {
+func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI string, fragment *TLSFragmentConfig, abort *dialAborter) (*http.Client, error) {
 	if endpoint == nil {
 		return nil, errors.New("missing HTTP/2 endpoint")
 	}
@@ -278,6 +388,10 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 				if err != nil {
 					return nil, err
 				}
+				// Сокет под контролем aborter'а: прерывание попытки (таймаут
+				// или победа другого кандидата) закроет его вместе с TLS и
+				// ожиданием ответа CONNECT.
+				abort.track(conn)
 
 				tlsConn := tls.Client(wrapTLSFragment(conn, fragment), tlsConfig)
 				if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -302,7 +416,11 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 			if addr == originAuthority {
 				addr = endpoint.String()
 			}
-			return dialer.DialContext(ctx, network, addr)
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err == nil {
+				abort.track(conn)
+			}
+			return conn, err
 		},
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialAddr := addr
@@ -319,6 +437,7 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 			if err != nil {
 				return nil, err
 			}
+			abort.track(conn)
 
 			if fragmentOrigin {
 				conn = wrapTLSFragment(conn, fragment)
