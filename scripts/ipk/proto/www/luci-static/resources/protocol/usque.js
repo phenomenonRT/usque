@@ -380,6 +380,11 @@ return network.registerProtocol('usque', {
 		o.depends('profile', 'h2');
 		o.depends('profile', 'manual');
 
+		o = s.taboption('advanced', form.Value, 'bypass_sni', _('Свои SNI для обхода'),
+			_('Имена через пробел или запятую. Полностью заменяют встроенный список SNI. Нужны, когда провайдер блокирует домены Cloudflare по имени: сертификат сервера проверяется по ключу, поэтому подойдёт любое незаблокированное имя.'));
+		o.placeholder = 'www.example.com';
+		o.optional = true;
+
 		o = s.taboption('advanced', form.Value, 'connect_timeout', _('Ожидание подключения (секунды)'),
 			_('Сколько всего ждать, пока тоннель поднимется. Пусто: 90 с в режиме обхода, 20 с в остальных.'));
 		o.datatype = 'uinteger';

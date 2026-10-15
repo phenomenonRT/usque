@@ -40,6 +40,8 @@ func addBypassFlags(c *cobra.Command) {
 		"Обход блокировок ТСПУ (DPI): перебирать адреса, порты и SNI Cloudflare, дробить TLS ClientHello. Ничего в сервере не меняет.")
 	c.Flags().StringArray("bypass-endpoint", nil,
 		"Свои адреса сервера Cloudflare для перебора (можно несколько раз). Работает вместе с --bypass.")
+	c.Flags().StringArray("bypass-sni", nil,
+		"Свои SNI для перебора в режиме --bypass (можно несколько раз). Полностью заменяет встроенный список имён — пригодится, когда провайдер блокирует домены Cloudflare по SNI. Подходит любое незаблокированное имя.")
 	c.Flags().Bool("tls-fragment", true,
 		"В режиме --bypass дробить TLS ClientHello на несколько TCP-сегментов (для HTTP/2).")
 	c.Flags().IntSlice("tls-fragment-sizes", []int{1},
@@ -119,7 +121,12 @@ func buildTunnelPlan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *
 		return plan, err
 	}
 
-	snis := bypassSNIs(sni, sniChanged, internal.BypassSNIs)
+	extraSNIs, err := cmd.Flags().GetStringArray("bypass-sni")
+	if err != nil {
+		return plan, err
+	}
+
+	snis := bypassSNIs(sni, sniChanged, extraSNIs, internal.BypassSNIs)
 	tlsBySNI := make(map[string]*tls.Config, len(snis))
 	for _, s := range snis {
 		cfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, s, insecure)
@@ -239,10 +246,20 @@ func preferHTTP2(in []api.TunnelCandidate) []api.TunnelCandidate {
 	return out
 }
 
-// bypassSNIs возвращает список SNI для перебора. Если пользователь указал
-// своё имя через -s, используется только оно. Иначе первым идёт имя из конфига
-// команды (sni), затем список запасных имён pool.
-func bypassSNIs(sni string, sniChanged bool, pool []string) []string {
+// bypassSNIs возвращает список SNI для перебора.
+//
+//   - extra (флаг --bypass-sni) полностью заменяет встроенный пул: если он
+//     задан, перебираются ровно его значения (плюс sni, если -s указан явно).
+//     Так можно уйти от блокировки доменов Cloudflare;
+//   - иначе при явном -s используется только оно (перебор SNI отключается);
+//   - иначе первым идёт имя из конфига команды (sni), затем пул pool.
+func bypassSNIs(sni string, sniChanged bool, extra []string, pool []string) []string {
+	if len(extra) > 0 {
+		if sniChanged && sni != "" {
+			return dedupeStrings(append([]string{sni}, extra...))
+		}
+		return dedupeStrings(extra)
+	}
 	if sniChanged && sni != "" {
 		return []string{sni}
 	}
@@ -327,7 +344,12 @@ func buildL4Plan(cmd *cobra.Command, privKey *ecdsa.PrivateKey, peerPubKey *ecds
 		return plan, err
 	}
 
-	snis := bypassSNIs(sni, sniChanged, internal.BypassSNIs)
+	extraSNIs, err := cmd.Flags().GetStringArray("bypass-sni")
+	if err != nil {
+		return plan, err
+	}
+
+	snis := bypassSNIs(sni, sniChanged, extraSNIs, internal.BypassSNIs)
 	tlsBySNI := make(map[string]*tls.Config, len(snis))
 	for _, s := range snis {
 		cfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, s, insecure)

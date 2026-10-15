@@ -577,13 +577,14 @@ usque --config config.json nativetun --bypass -n usque0
 When `--bypass` is set, the client tries the following combinations until one connects, remembers the winner and prefers it on reconnect:
 
 1. **Port sweep** — the configured server address with the standard port first (443) and the documented fallbacks (`500`, `1701`, `4500`, `4443`, `8443`, `8095`) after it.
-2. **SNI sweep** — alternative names in the TLS handshake (`zt-masque.cloudflareclient.com`, `one.one.one.one`, `www.cloudflare.com`). Passing `-s` disables the sweep and pins your own name.
+2. **SNI sweep** — alternative names in the TLS handshake (`zt-masque.cloudflareclient.com`, `one.one.one.one`, `www.cloudflare.com`, plus neutral non-Cloudflare names). Passing `-s` disables the sweep and pins your own name.
 3. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses (`162.159.197.0/24`, `162.159.192.1`, `162.159.193.1`, `162.159.195.1`, `162.159.204.1`, …).
 4. **Address × SNI pairs** for the remaining combinations.
 
 Additional knobs:
 
 - `--bypass-endpoint <ip>` (repeatable) — add your own server addresses to the end of the sweep.
+- `--bypass-sni <name>` (repeatable) — replace the built-in SNI list with your own names. Use this when your provider blocks Cloudflare domains by SNI: the server ignores the name (the client pins the endpoint's public key, not the certificate name), so any non-blocked domain works. Example: `--bypass --bypass-sni www.example.com`.
 - `--tls-fragment` / `--tls-fragment-sizes` — for HTTP/2 candidates, split the TLS ClientHello into separate TCP segments so a middlebox cannot see the handshake in one packet (default: 1 byte, then the rest).
 - `--connect-timeout` — bound a single candidate attempt (default `5s`), so silently dropped addresses are skipped quickly.
 - In bypass mode the initial QUIC packet is capped at 1200 bytes, which disables PMTU probing with large packets that are often dropped silently.

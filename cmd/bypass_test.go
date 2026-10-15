@@ -52,7 +52,7 @@ func TestPrefixEndpoint(t *testing.T) {
 }
 
 func TestBypassSNIsDefaultStartsWithConfigSNI(t *testing.T) {
-	got := bypassSNIs(internal.ConnectSNI, false, internal.BypassSNIs)
+	got := bypassSNIs(internal.ConnectSNI, false, nil, internal.BypassSNIs)
 	if len(got) == 0 || got[0] != internal.ConnectSNI {
 		t.Fatalf("first SNI = %q, want %q", got[0], internal.ConnectSNI)
 	}
@@ -67,17 +67,34 @@ func TestBypassSNIsDefaultStartsWithConfigSNI(t *testing.T) {
 }
 
 func TestBypassSNIsUserOverride(t *testing.T) {
-	got := bypassSNIs("example.com", true, internal.BypassSNIs)
+	got := bypassSNIs("example.com", true, nil, internal.BypassSNIs)
 	want := []string{"example.com"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("bypassSNIs override = %v, want %v", got, want)
 	}
 }
 
+func TestBypassSNIsExtraReplacesPool(t *testing.T) {
+	// --bypass-sni must fully replace the built-in Cloudflare pool so a blocked
+	// region can sweep only non-Cloudflare names.
+	got := bypassSNIs(internal.ConnectSNI, false, []string{"www.example.org", "cdn.example.net"}, internal.BypassSNIs)
+	want := []string{"www.example.org", "cdn.example.net"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("bypassSNIs extra = %v, want %v", got, want)
+	}
+
+	// An explicit -s is kept first, then the extra names.
+	got = bypassSNIs("pinned.example", true, []string{"www.example.org"}, internal.BypassSNIs)
+	want = []string{"pinned.example", "www.example.org"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("bypassSNIs pinned+extra = %v, want %v", got, want)
+	}
+}
+
 func TestL4DefaultSNIFirstInPool(t *testing.T) {
 	// buildL4Plan relies on this: the L4 default SNI must come first so the
 	// primary port sweep uses it.
-	got := bypassSNIs(internal.L4ConnectSNI, false, internal.BypassSNIs)
+	got := bypassSNIs(internal.L4ConnectSNI, false, nil, internal.BypassSNIs)
 	if len(got) == 0 || got[0] != internal.L4ConnectSNI {
 		t.Fatalf("first L4 SNI = %q, want %q", got[0], internal.L4ConnectSNI)
 	}

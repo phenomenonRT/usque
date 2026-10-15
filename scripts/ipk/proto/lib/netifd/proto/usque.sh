@@ -59,6 +59,7 @@ proto_usque_init_config() {
 	proto_config_add_boolean "insecure"
 	proto_config_add_int "connect_timeout"
 	proto_config_add_boolean "bypass"
+	proto_config_add_string "bypass_sni"
 	proto_config_add_string "args"
 }
 
@@ -203,12 +204,12 @@ proto_usque_setup() {
 	local interface="$1"
 	local config profile endpoint endpoint_h2 defaultroute metric mtu connect_port sni http2 ipv6
 	local tunnel_ipv4 tunnel_ipv6 keepalive reconnect_delay initial_packet_size
-	local insecure connect_timeout bypass args
+	local insecure connect_timeout bypass bypass_sni args
 	local ifname cfg use_bypass cands c m p ep ep_h2 tmo i pid
 
 	json_get_vars config profile endpoint endpoint_h2 defaultroute metric mtu connect_port sni \
 		http2 ipv6 tunnel_ipv4 tunnel_ipv6 keepalive reconnect_delay initial_packet_size \
-		insecure connect_timeout bypass args
+		insecure connect_timeout bypass bypass_sni args
 
 	[ -n "$config" ] || config=/etc/usque/config.json
 	[ -n "$profile" ] || profile=auto
@@ -302,7 +303,18 @@ proto_usque_setup() {
 		# что без этого флага первое подключение ждало бы трафик, которого до
 		# подключения быть не может.
 		set -- -c "$cfg" nativetun -n "$ifname" -I -m "$mtu" -P "$p" --always-reconnect
-		[ "$use_bypass" = 1 ] && set -- "$@" --bypass
+		if [ "$use_bypass" = 1 ]; then
+			set -- "$@" --bypass
+			# Свой список SNI (пробел или запятая) полностью заменяет
+			# встроенный — пригодится, когда домены Cloudflare блокируют.
+			if [ -n "$bypass_sni" ]; then
+				set -f
+				for s in $(printf '%s' "$bypass_sni" | tr ', ' '  '); do
+					[ -n "$s" ] && set -- "$@" --bypass-sni "$s"
+				done
+				set +f
+			fi
+		fi
 		[ "$m" = h2 ] && set -- "$@" --http2
 		[ -n "$sni" ] && set -- "$@" -s "$sni"
 		[ "$ipv6" = 1 ] && set -- "$@" -6
