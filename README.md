@@ -1,7 +1,7 @@
 # usque
 
 🥚➡️🍏🍎
-
+Еще не работает стабильно.
 Usque is an open-source reimplementation of the Cloudflare WARP client's MASQUE mode. It leverages the [Connect-IP (RFC 9484)](https://datatracker.ietf.org/doc/rfc9484/) protocol and comes with many operation modes including a native tunnel, SOCKS5 and HTTP proxies, and faster TCP-only L4 proxy variants.
 
 ## Table of Contents
@@ -578,7 +578,7 @@ usque --config config.json nativetun --bypass -n usque0
 When `--bypass` is set, the client tries the following combinations until one connects, remembers the winner and prefers it on reconnect:
 
 1. **Port sweep** — the configured server address with the standard port first (443) and the documented fallbacks (`500`, `1701`, `4500`, `4443`, `8443`, `8095`) after it.
-2. **SNI sweep** — alternative names in the TLS handshake (`zt-masque.cloudflareclient.com`, `one.one.one.one`, `www.cloudflare.com`, plus neutral non-Cloudflare names). Passing `-s` disables the sweep and pins your own name.
+2. **SNI sweep** — alternative names in the TLS handshake (`zt-masque.cloudflareclient.com`, `one.one.one.one`, `www.cloudflare.com`, plus the non-Cloudflare `www.microsoft.com`, `www.apple.com`, `www.bing.com`). Passing `-s` disables the sweep and pins your own name.
 3. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses (`162.159.197.0/24`, `162.159.192.1`, `162.159.193.1`, `162.159.195.1`, `162.159.204.1`, …).
 4. **Address × SNI pairs** for the remaining combinations.
 

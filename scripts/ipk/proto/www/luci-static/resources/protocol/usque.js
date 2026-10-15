@@ -313,6 +313,9 @@ return network.registerProtocol('usque', {
 		o.value('zt-masque.cloudflareclient.com', 'zt-masque.cloudflareclient.com — рекомендует автор usque');
 		o.value('www.cloudflare.com', 'www.cloudflare.com — обычный сайт');
 		o.value('one.one.one.one', 'one.one.one.one — обычный сайт');
+		o.value('www.microsoft.com', 'www.microsoft.com — вне Cloudflare');
+		o.value('www.apple.com', 'www.apple.com — вне Cloudflare');
+		o.value('www.bing.com', 'www.bing.com — вне Cloudflare');
 		o.placeholder = 'consumer-masque.cloudflareclient.com';
 		o.optional = true;
 

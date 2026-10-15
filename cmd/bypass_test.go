@@ -91,6 +91,23 @@ func TestBypassSNIsExtraReplacesPool(t *testing.T) {
 	}
 }
 
+func TestBypassSNIsIncludesNonCloudflare(t *testing.T) {
+	// When a provider blocks Cloudflare domains by SNI, the sweep must still
+	// contain names outside Cloudflare.
+	for _, want := range []string{"www.microsoft.com", "www.apple.com", "www.bing.com"} {
+		found := false
+		for _, s := range internal.BypassSNIs {
+			if s == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("BypassSNIs is missing non-Cloudflare name %q: %v", want, internal.BypassSNIs)
+		}
+	}
+}
+
 func TestL4DefaultSNIFirstInPool(t *testing.T) {
 	// buildL4Plan relies on this: the L4 default SNI must come first so the
 	// primary port sweep uses it.
