@@ -583,7 +583,7 @@ When `--bypass` is set, the client walks the combinations **breadth-first** — 
 4. **Custom source ports** — only with `--bypass-source-port`.
 5. **Port sweep** — the configured server address with the standard port first (443) and the documented fallbacks (`500`, `1701`, `4500`, `4443`, `8443`, `8095`) after it.
 6. **SNI sweep** — `www.microsoft.com`, `www.apple.com`, `www.bing.com`, then the Cloudflare names (`one.one.one.one`, `www.cloudflare.com`, `zt-masque.cloudflareclient.com`, `consumer-masque.cloudflareclient.com`). Passing `-s` disables the sweep and pins your own name.
-7. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses (`162.159.197.0/24`, `162.159.192.0/24`, `162.159.193.0/24`, `162.159.195.0/24`, `162.159.204.0/24`).
+7. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses. Since the sweep stops at `maxBypassCandidates` (64), the pool starts with one address from **every** documented network — IPv4 `162.159.197.0/24` (MASQUE), `162.159.198.0/24` (this build's `config.json`), `162.159.192.0/24` (consumer WARP), `162.159.193.0/24` (WireGuard), `162.159.195.0/24`, `162.159.204.0/24`, `162.159.239.0/24` (FedRAMP MASQUE), and IPv6 `2606:4700:100::/48`, `2606:4700:102::/48`, `2606:4700:103::/48`, `2606:4700:105::/48` — and only then repeats the same networks in depth, so no network can be left untested by the cap.
 8. **Address × SNI pairs** for the remaining combinations.
 9. **IPv6 tail** — when IPv6 works on your network and `-6` was not given, up to a quarter of the list is filled with IPv6 combinations: providers often filter IPv4 much harder.
 

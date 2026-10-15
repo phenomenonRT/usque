@@ -509,6 +509,113 @@ func TestDedupePorts(t *testing.T) {
 	}
 }
 
+// TestSweepCoversEveryWARPGNetwork проверяет главное свойство перебора адресов:
+// лимит кандидатов обрывает список, поэтому каждая документированная сеть
+// WARP/MASQUE должна попасть в проверку, а не остаться за пределами лимита.
+// Именно так ломается наивный порядок «сначала один адрес, потом следующий»:
+// до последних сетей перебор просто не доходит.
+func TestSweepCoversEveryWARPGNetwork(t *testing.T) {
+	tlsConfigs := func(snis []string) map[string]*tls.Config {
+		out := make(map[string]*tls.Config, len(snis))
+		for _, s := range snis {
+			out[s] = &tls.Config{}
+		}
+		return out
+	}
+
+	got := buildCandidates(candidateInput{
+		SNIs:     internal.BypassSNIs,
+		TLSBySNI: tlsConfigs(internal.BypassSNIs),
+		QUICIPs:  append([]string{"162.159.198.1"}, internal.BypassEndpointsV4...),
+		H2IPs:    append([]string{"162.159.198.2"}, internal.BypassEndpointsV4...),
+		Ports:    internal.BypassQUICPorts,
+		H2Ports:  []int{internal.BypassH2Port},
+	})
+	if len(got) != maxBypassCandidates {
+		t.Fatalf("got %d candidates, want the sweep to be full (%d)", len(got), maxBypassCandidates)
+	}
+
+	covered := map[string]bool{}
+	for _, c := range got {
+		var ip net.IP
+		switch addr := c.Endpoint.(type) {
+		case *net.UDPAddr:
+			ip = addr.IP
+		case *net.TCPAddr:
+			ip = addr.IP
+		}
+		if ip == nil {
+			continue
+		}
+		covered[ip.Mask(net.CIDRMask(24, 32)).String()+"/24"] = true
+	}
+	for _, cidr := range internal.BypassCIDRsV4 {
+		if !covered[cidr] {
+			t.Errorf("сеть %s не проверяется ни одной комбинацией: перебор заканчивается раньше", cidr)
+		}
+	}
+}
+
+func TestBypassEndpointPoolStartsWithEveryNetwork(t *testing.T) {
+	// Порядок списка адресов — по одному представителю каждой сети в начале.
+	// Иначе, как показано выше, до части сетей перебор может не дойти.
+	want := len(internal.BypassCIDRsV4)
+	if len(internal.BypassEndpointsV4) < want {
+		t.Fatalf("в BypassEndpointsV4 адресов меньше, чем сетей в BypassCIDRsV4")
+	}
+	seen := map[string]bool{}
+	for _, ip := range internal.BypassEndpointsV4[:want] {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			t.Fatalf("BypassEndpointsV4 contains an invalid address %q", ip)
+		}
+		seen[parsed.Mask(net.CIDRMask(24, 32)).String()+"/24"] = true
+	}
+	for _, cidr := range internal.BypassCIDRsV4 {
+		if !seen[cidr] {
+			t.Errorf("в первых %d адресах BypassEndpointsV4 нет адреса из %s", want, cidr)
+		}
+	}
+}
+
+func TestBypassIPv6PoolCoversItsNetworks(t *testing.T) {
+	// У IPv6-хвоста перебора совсем мало места, поэтому каждая /48 должна быть
+	// представлена в самом начале списка, а не где-то в глубине.
+	want := len(internal.BypassCIDRsV6)
+	if len(internal.BypassEndpointsV6) < want {
+		t.Fatalf("в BypassEndpointsV6 адресов меньше, чем сетей в BypassCIDRsV6")
+	}
+	all := map[string]bool{}
+	for _, ip := range internal.BypassEndpointsV6 {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			t.Fatalf("BypassEndpointsV6 contains an invalid address %q", ip)
+		}
+		if parsed.To4() != nil {
+			t.Fatalf("BypassEndpointsV6 contains an IPv4 address %q", ip)
+		}
+		all[ipv6NetworkOf(parsed)] = true
+	}
+	head := map[string]bool{}
+	for _, ip := range internal.BypassEndpointsV6[:want] {
+		head[ipv6NetworkOf(net.ParseIP(ip))] = true
+	}
+	for _, cidr := range internal.BypassCIDRsV6 {
+		if !all[cidr] {
+			t.Errorf("в BypassEndpointsV6 нет адреса из %s", cidr)
+		}
+		if !head[cidr] {
+			t.Errorf("в первых %d адресах BypassEndpointsV6 нет адреса из %s", want, cidr)
+		}
+	}
+}
+
+// ipv6NetworkOf возвращает /48-сеть адреса в виде, в котором её пишут CIDR-списки.
+func ipv6NetworkOf(ip net.IP) string {
+	masked := ip.Mask(net.CIDRMask(48, 128))
+	return masked.String() + "/48"
+}
+
 func labelsOf(cands []api.TunnelCandidate) []string {
 	out := make([]string, 0, len(cands))
 	for _, c := range cands {

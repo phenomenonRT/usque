@@ -32,8 +32,8 @@ USQUE_DEFAULT_H2_V4=162.159.198.2
 # (напрямую через прежний шлюз). Иначе после подъёма интерфейса перебор адресов
 # ушёл бы сам в себя. Список должен покрывать пул из internal/bypass.go
 # (BypassCIDRsV4 / BypassCIDRsV6) — держите их в синхроне.
-USQUE_BYPASS_V4_CIDRS="162.159.192.0/24 162.159.193.0/24 162.159.195.0/24 162.159.197.0/24 162.159.198.0/24 162.159.204.0/24"
-USQUE_BYPASS_V6_CIDRS="2606:4700:102::/48"
+USQUE_BYPASS_V4_CIDRS="162.159.192.0/24 162.159.193.0/24 162.159.195.0/24 162.159.197.0/24 162.159.198.0/24 162.159.204.0/24 162.159.239.0/24"
+USQUE_BYPASS_V6_CIDRS="2606:4700:100::/48 2606:4700:102::/48 2606:4700:103::/48 2606:4700:105::/48"
 
 proto_usque_init_config() {
 	# своего устройства у протокола нет: его создаёт usque, имя usque-<интерфейс>
@@ -158,20 +158,19 @@ usque_pin_endpoint() { # интерфейс ep
 }
 
 # в режиме обхода уводим мимо тоннеля весь пул адресов Cloudflare, чтобы
-# перебор работал и после подъёма интерфейса (см. USQUE_BYPASS_*_CIDRS)
-usque_pin_bypass() { # интерфейс v6
-	local interface="$1" v6="$2" cidr
-	if [ "$v6" = 1 ]; then
-		for cidr in $USQUE_BYPASS_V6_CIDRS; do
-			usque_pin_route "$interface" "-6" "$cidr" ||
-				logger -t usque "$interface: не удалось закрепить $cidr"
-		done
-	else
-		for cidr in $USQUE_BYPASS_V4_CIDRS; do
-			usque_pin_route "$interface" "-4" "$cidr" ||
-				logger -t usque "$interface: не удалось закрепить $cidr"
-		done
-	fi
+# перебор работал и после подъёма интерфейса (см. USQUE_BYPASS_*_CIDRS).
+# Закрепляются оба семейства: перебор может добавить IPv6-комбинации, даже
+# если -6 не задан (usque --bypass-ipv6-fallback).
+usque_pin_bypass() { # интерфейс
+	local interface="$1" cidr
+	for cidr in $USQUE_BYPASS_V6_CIDRS; do
+		usque_pin_route "$interface" "-6" "$cidr" ||
+			logger -t usque "$interface: не удалось закрепить $cidr"
+	done
+	for cidr in $USQUE_BYPASS_V4_CIDRS; do
+		usque_pin_route "$interface" "-4" "$cidr" ||
+			logger -t usque "$interface: не удалось закрепить $cidr"
+	done
 }
 
 usque_unpin() {
@@ -192,8 +191,10 @@ usque_cleanup() {
 		"$USQUE_STATE/$interface.routes"
 }
 
-# запомнить удачный способ больше не нужно: в режиме auto usque перебирает
-# комбинации сам и держит победителя в памяти на время работы процесса.
+# Способ (quic/h2) здесь не запоминается: в режиме auto usque перебирает
+# комбинации сам и держит победителя в памяти на время работы процесса, а
+# удачную комбинацию обхода сохраняет по --bypass-state (галочка
+# «Запоминать рабочую комбинацию обхода», файл рядом с config.json).
 
 usque_fail() { # интерфейс КОД
 	logger -t usque "$1: $2"
@@ -304,7 +305,7 @@ proto_usque_setup() {
 				if [ -n "$ep_h2" ] && [ "$ep_h2" != "$ep" ]; then
 					usque_pin_endpoint "$interface" "$ep_h2"
 				fi
-				usque_pin_bypass "$interface" "$ipv6"
+				usque_pin_bypass "$interface"
 			fi
 		fi
 
