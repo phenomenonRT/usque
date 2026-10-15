@@ -22,6 +22,9 @@ var callStop = rpc.declare({
 var callRestart = rpc.declare({
 	object: 'usque', method: 'restart', params: [ 'iface' ], expect: { '': {} }
 });
+var callCheck = rpc.declare({
+	object: 'usque', method: 'check', params: [ 'iface' ], expect: { '': {} }
+});
 var callRegister = rpc.declare({
 	object: 'usque', method: 'register', params: [ 'config', 'name', 'force' ], expect: { '': {} }
 });
@@ -128,9 +131,17 @@ function statusBox(sid) {
 			btn('Стоп', 'cbi-button-negative', function() { return callStop(sid); }, false),
 			btn('Перезапуск', 'cbi-button-action', function() { return callRestart(sid); },
 				!info.config_exists),
+			btn('Проверить', 'cbi-button-action', function() { return callCheck(sid); },
+				!info.config_exists),
 			btn('Обновить', 'cbi-button-neutral', function() { return Promise.resolve(); }, false)
 		]);
 		kids.push(buttons);
+
+		/* результат кнопки «Проверить» (запускается в фоне, показывается по опросу) */
+		if (info.check_running || info.check)
+			kids.push(E('pre', {
+				'style': 'white-space:pre-wrap;max-height:16em;overflow:auto;margin:.4em 0;background:#f6f6f6;padding:.4em;border-radius:3px'
+			}, (info.check_running ? 'Проверка… (это может занять до минуты)\n' : '') + (info.check || '')));
 
 		/* регистрация */
 		var nameInput = E('input', {

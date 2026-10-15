@@ -40,6 +40,10 @@ cfgval() { # файл ключ
 	jsonfilter -i "$1" -e "@.$2" 2>/dev/null
 }
 
+uci_get() { # network.<iface>.<opt>
+	uci -q get "$1" 2>/dev/null
+}
+
 arg() { # ключ
 	jsonfilter -s "$INPUT" -e "@.$1" 2>/dev/null
 }
@@ -59,6 +63,7 @@ reply_err() { # код [текст]
 do_info() {
 	local iface cfg exists=0 running=0 up=0 netifd_up=0
 	local mode port endpoint sni profile log
+	local check check_running=0 cpid
 
 	iface="$(arg iface)"
 	cfg="$(arg config)"
@@ -77,6 +82,10 @@ do_info() {
 	profile="$(kv "$STATE/$iface.cur" profile)"
 	log="$(tail -n 15 "$STATE/$iface.log" 2>/dev/null | jlines)"
 
+	cpid="$(cat "$STATE/$iface.checkpid" 2>/dev/null)"
+	[ -n "$cpid" ] && [ -d "/proc/$cpid" ] && check_running=1
+	check="$(tail -n 40 "$STATE/$iface.check" 2>/dev/null | jlines)"
+
 	printf '{"ok":true,"config_exists":%s,"running":%s,"up":%s,"netifd_up":%s,' \
 		"$(jbool $exists)" "$(jbool $running)" "$(jbool $up)" "$(jbool $netifd_up)"
 	printf '"mode":"%s","port":"%s","endpoint":"%s","sni":"%s","profile":"%s",' \
@@ -87,7 +96,7 @@ do_info() {
 			"$(jesc "$(cfgval "$cfg" endpoint_h2_v4)")" "$(jesc "$(cfgval "$cfg" endpoint_h2_v6)")" \
 			"$(jesc "$(cfgval "$cfg" ipv4)")" "$(jesc "$(cfgval "$cfg" ipv6)")"
 	fi
-	printf '"log":"%s"}\n' "$log"
+	printf '"log":"%s","check_running":%s,"check":"%s"}\n' "$log" "$(jbool $check_running)" "$check"
 }
 
 do_start() {
@@ -99,7 +108,7 @@ do_start() {
 }
 
 do_stop() {
-	local iface pid fam ep
+	local iface pid fam ep cpid
 	iface="$(arg iface)"
 	valid_iface "$iface" || { reply_err BAD_IFACE; return; }
 
@@ -118,8 +127,13 @@ do_stop() {
 			[ -n "$ep" ] && ip $fam route del "$ep" 2>/dev/null
 		done < "$STATE/$iface.routes"
 	fi
+	if [ -r "$STATE/$iface.checkpid" ]; then
+		cpid="$(cat "$STATE/$iface.checkpid" 2>/dev/null)"
+		[ -n "$cpid" ] && [ -d "/proc/$cpid" ] && kill "$cpid" 2>/dev/null
+	fi
 	rm -f "$STATE/$iface.up" "$STATE/$iface.cur" "$STATE/$iface.pid" \
-		"$STATE/$iface.routes" "$STATE/$iface.json"
+		"$STATE/$iface.routes" "$STATE/$iface.json" \
+		"$STATE/$iface.check" "$STATE/$iface.checkpid"
 	printf '{"ok":true}\n'
 }
 
@@ -130,6 +144,85 @@ do_restart() {
 	ifdown "$iface" >/dev/null 2>&1
 	sleep 1
 	ifup "$iface" >/dev/null 2>&1
+	printf '{"ok":true}\n'
+}
+
+# Проверка подключения без поднятия интерфейса: запускаем `usque check` в фоне,
+# вывод пишем в $STATE/<iface>.check, статус читается в do_info. Кнопка в LuCI
+# лишь запускает проверку, а результат подхватывает обычный опрос панели.
+do_check() {
+	local iface cfg profile connect_port sni ipv6 http2 bypass bypass_sni
+	local initial_packet_size insecure connect_timeout args endpoint endpoint_h2
+	local use_bypass p s pid pidfile
+
+	iface="$(arg iface)"
+	valid_iface "$iface" || { reply_err BAD_IFACE; return; }
+	[ -x "$BIN" ] || { reply_err NO_BINARY; return; }
+
+	cfg="$(uci_get "network.$iface.config")"
+	[ -n "$cfg" ] || cfg=/etc/usque/config.json
+	valid_cfg "$cfg" || { reply_err BAD_CONFIG_PATH; return; }
+	[ -r "$cfg" ] || { reply_err NO_CONFIG; return; }
+
+	profile="$(uci_get "network.$iface.profile")"
+	connect_port="$(uci_get "network.$iface.connect_port")"
+	sni="$(uci_get "network.$iface.sni")"
+	ipv6="$(uci_get "network.$iface.ipv6")"
+	http2="$(uci_get "network.$iface.http2")"
+	bypass="$(uci_get "network.$iface.bypass")"
+	bypass_sni="$(uci_get "network.$iface.bypass_sni")"
+	initial_packet_size="$(uci_get "network.$iface.initial_packet_size")"
+	insecure="$(uci_get "network.$iface.insecure")"
+	connect_timeout="$(uci_get "network.$iface.connect_timeout")"
+	args="$(uci_get "network.$iface.args")"
+	endpoint="$(uci_get "network.$iface.endpoint")"
+	endpoint_h2="$(uci_get "network.$iface.endpoint_h2")"
+
+	use_bypass=0
+	case "$profile" in auto) use_bypass=1 ;; esac
+	[ "$bypass" = 1 ] && use_bypass=1
+
+	p="${connect_port:-443}"
+	set -- -c "$cfg" check -P "$p"
+	[ "$ipv6" = 1 ] && set -- "$@" -6
+	if [ "$use_bypass" = 1 ]; then
+		set -- "$@" --bypass
+		[ -n "$endpoint" ] && set -- "$@" --bypass-endpoint "$endpoint"
+		[ -n "$endpoint_h2" ] && set -- "$@" --bypass-endpoint "$endpoint_h2"
+		if [ -n "$bypass_sni" ]; then
+			set -f
+			for s in $(printf '%s' "$bypass_sni" | tr ', ' '  '); do
+				[ -n "$s" ] && set -- "$@" --bypass-sni "$s"
+			done
+			set +f
+		fi
+	elif [ "$profile" = h2 ] || { [ "$profile" = manual ] && [ "$http2" = 1 ]; }; then
+		set -- "$@" --http2
+	fi
+	[ -n "$sni" ] && set -- "$@" -s "$sni"
+	[ -n "$initial_packet_size" ] && set -- "$@" -i "$initial_packet_size"
+	[ "$insecure" = 1 ] && set -- "$@" --insecure
+	[ -n "$connect_timeout" ] && set -- "$@" --connect-timeout "${connect_timeout}s"
+	if [ -n "$args" ]; then
+		set -f
+		set -- "$@" $args
+		set +f
+	fi
+
+	mkdir -p "$STATE"
+	pidfile="$STATE/$iface.checkpid"
+	if [ -f "$pidfile" ]; then
+		pid="$(cat "$pidfile" 2>/dev/null)"
+		[ -n "$pid" ] && [ -d "/proc/$pid" ] && kill "$pid" 2>/dev/null
+	fi
+	rm -f "$STATE/$iface.check"
+
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 120 "$BIN" "$@" > "$STATE/$iface.check" 2>&1 &
+	else
+		"$BIN" "$@" > "$STATE/$iface.check" 2>&1 &
+	fi
+	echo "$!" > "$pidfile"
 	printf '{"ok":true}\n'
 }
 
@@ -176,6 +269,7 @@ list)
 	"start": { "iface": "str" },
 	"stop": { "iface": "str" },
 	"restart": { "iface": "str" },
+	"check": { "iface": "str" },
 	"register": { "config": "str", "name": "str", "force": 0 }
 }
 EOF
@@ -188,6 +282,7 @@ call)
 	start) do_start ;;
 	stop) do_stop ;;
 	restart) do_restart ;;
+	check) do_check ;;
 	register) do_register ;;
 	*) reply_err UNKNOWN_METHOD ;;
 	esac

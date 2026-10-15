@@ -97,6 +97,7 @@ Usage:
   usque [command]
 
 Available Commands:
+  check         Проверить подключение к MASQUE и подобрать рабочую комбинацию
   completion    Generate the autocompletion script for the specified shell
   enroll        Enrolls a MASQUE private key and switches mode
   help          Help about any command
@@ -588,6 +589,15 @@ Additional knobs:
 - `--tls-fragment` / `--tls-fragment-sizes` — for HTTP/2 candidates, split the TLS ClientHello into separate TCP segments so a middlebox cannot see the handshake in one packet (default: 1 byte, then the rest).
 - `--connect-timeout` — bound a single candidate attempt (default `5s`), so silently dropped addresses are skipped quickly.
 - In bypass mode the initial QUIC packet is capped at 1200 bytes, which disables PMTU probing with large packets that are often dropped silently.
+
+To find out which combination actually works on your network without bringing up a tunnel, use `check` (same sweep, no TUN, nothing changed on the system):
+
+```sh
+usque --config config.json check --bypass
+usque --config config.json check --bypass --bypass-sni www.example.com
+```
+
+It prints the first working combination (address, port, SNI, transport) or the list of failed attempts, and exits `0` if at least one combination connected.
 
 On OpenWrt the `auto` profile enables `--bypass` automatically and pins the Cloudflare ranges outside the tunnel; see [`_docs/openwrt.md`](_docs/openwrt.md#41-настройка-обхода-блокировок-тспу).
 
