@@ -597,9 +597,11 @@ To find out which combination actually works on your network without bringing up
 ```sh
 usque --config config.json check --bypass
 usque --config config.json check --bypass --bypass-sni www.example.com
+usque --config config.json check --bypass --all                 # test everything, not just up to the first success
+usque --config config.json check --bypass --bypass-parallel 5   # more attempts at once
 ```
 
-It prints the first working combination (address, port, SNI, transport) or the list of failed attempts, and exits `0` if at least one combination connected.
+It prints the first working combination (address, port, SNI, transport) or the list of failed attempts, and exits `0` if at least one combination connected. After the list it prints a `Вывод:` line that names the blocking it can see — for example HTTP/2 working while every QUIC attempt failed (UDP is filtered), a non-default port or SNI working (that port or name is filtered), or neither transport working at all (the Cloudflare ranges themselves are unreachable, which client-side tricks cannot fix).
 
 On OpenWrt the `auto` profile enables `--bypass` automatically and pins the Cloudflare ranges outside the tunnel; see [`_docs/openwrt.md`](_docs/openwrt.md#41-настройка-обхода-блокировок-тспу).
 

@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -141,6 +142,7 @@ var checkCmd = &cobra.Command{
 
 		okCount := 0
 		firstOK := ""
+		outcomes := make([]*checkOutcome, len(candidates))
 		for inFlight > 0 {
 			var res checkResult
 			select {
@@ -151,6 +153,7 @@ var checkCmd = &cobra.Command{
 			inFlight--
 
 			cand := candidates[res.idx]
+			outcomes[res.idx] = outcomeOf(cand, res.reason == "")
 			if res.reason == "" {
 				okCount++
 				if firstOK == "" {
@@ -170,6 +173,13 @@ var checkCmd = &cobra.Command{
 			}
 		}
 
+		// Итог в терминах того, что именно мешает: это и есть ответ на вопрос
+		// «работает ли обход в моей сети и почему нет».
+		verdict := checkVerdict(collectOutcomes(outcomes))
+		for _, line := range verdict {
+			cmd.Printf("Вывод: %s\n", line)
+		}
+
 		if okCount == 0 {
 			cmd.Println("Результат: ни одна комбинация не сработала.")
 			return fmt.Errorf("не удалось подключиться")
@@ -177,6 +187,106 @@ var checkCmd = &cobra.Command{
 		cmd.Printf("Результат: работает %d из %d. Рабочая комбинация: %s\n", okCount, len(candidates), firstOK)
 		return nil
 	},
+}
+
+// checkOutcome — то, что нужно знать о попытке, чтобы объяснить её результат.
+type checkOutcome struct {
+	useHTTP2 bool
+	sni      string
+	port     int
+	ok       bool
+}
+
+// outcomeOf снимает параметры попытки с кандидата.
+func outcomeOf(cand api.TunnelCandidate, ok bool) *checkOutcome {
+	out := &checkOutcome{useHTTP2: cand.UseHTTP2, ok: ok}
+	if cand.TLSConfig != nil {
+		out.sni = cand.TLSConfig.ServerName
+	}
+	switch addr := cand.Endpoint.(type) {
+	case *net.UDPAddr:
+		out.port = addr.Port
+	case *net.TCPAddr:
+		out.port = addr.Port
+	}
+	return out
+}
+
+// collectOutcomes оставляет только выполненные попытки, сохраняя их порядок в
+// списке кандидатов.
+func collectOutcomes(slots []*checkOutcome) []checkOutcome {
+	out := make([]checkOutcome, 0, len(slots))
+	for _, slot := range slots {
+		if slot != nil {
+			out = append(out, *slot)
+		}
+	}
+	return out
+}
+
+// checkVerdict переводит результаты попыток на человеческий язык. Выводы
+// намеренно осторожные: проверка останавливается на первом успехе, поэтому
+// «QUIC не сработал» может означать и «QUIC закрыт», и «до него не дошло».
+func checkVerdict(outcomes []checkOutcome) []string {
+	if len(outcomes) == 0 {
+		return nil
+	}
+
+	var (
+		quicTotal, quicOK int
+		h2Total           int
+		winner            *checkOutcome
+	)
+	for i := range outcomes {
+		out := outcomes[i]
+		switch {
+		case out.useHTTP2:
+			h2Total++
+		default:
+			quicTotal++
+			if out.ok {
+				quicOK++
+			}
+		}
+		if out.ok && winner == nil {
+			winner = &outcomes[i]
+		}
+	}
+
+	if winner == nil {
+		switch {
+		case quicTotal > 0 && h2Total > 0:
+			return []string{
+				"ни UDP/QUIC, ни TCP/HTTP-2 до Cloudflare не проходят.",
+				"Скорее всего, провайдер блокирует адреса Cloudflare целиком — обходом на стороне клиента это не обойти. Стоит попробовать IPv6 (флаг -6 в usque и «Использовать IPv6» в LuCI).",
+			}
+		case quicTotal > 0:
+			return []string{
+				"по UDP не прошла ни одна попытка: похоже, провайдер режет QUIC.",
+				"Проверьте HTTP/2 — в LuCI режим «HTTP/2 (TCP 443)» или флаг --http2.",
+			}
+		default:
+			return []string{
+				"по TCP не прошла ни одна попытка: похоже, провайдер режет и HTTP/2 к Cloudflare.",
+				"Проверьте QUIC (режим «QUIC / HTTP/3» в LuCI) и IPv6.",
+			}
+		}
+	}
+
+	first := outcomes[0]
+	var lines []string
+	if winner.useHTTP2 && !first.useHTTP2 && quicOK == 0 {
+		lines = append(lines, "работает HTTP/2 (TCP), а QUIC не сработал: похоже, провайдер режет UDP — так и оставьте.")
+	}
+	if !winner.useHTTP2 && winner.port != first.port && first.port != 0 {
+		lines = append(lines,
+			fmt.Sprintf("работает порт %d, а порт %d нет: похоже, стандартный порт закрыт.", winner.port, first.port))
+	}
+	if winner.sni != "" && first.sni != "" && winner.sni != first.sni {
+		lines = append(lines,
+			fmt.Sprintf("работает имя %s, а %s нет: похоже, провайдер режет имена по SNI.", winner.sni, first.sni))
+	}
+	return lines
 }
 
 // checkCandidate выполняет одну попытку подключения к MASQUE и возвращает

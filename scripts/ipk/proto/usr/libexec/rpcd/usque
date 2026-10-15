@@ -217,8 +217,10 @@ do_check() {
 	fi
 	rm -f "$STATE/$iface.check"
 
+	# Полный перебор — до 64 комбинаций по 5 секунд, по несколько одновременно,
+	# поэтому 120 секунд не хватало: проверка обрывалась на середине списка.
 	if command -v timeout >/dev/null 2>&1; then
-		timeout 120 "$BIN" "$@" > "$STATE/$iface.check" 2>&1 &
+		timeout 300 "$BIN" "$@" > "$STATE/$iface.check" 2>&1 &
 	else
 		"$BIN" "$@" > "$STATE/$iface.check" 2>&1 &
 	fi
