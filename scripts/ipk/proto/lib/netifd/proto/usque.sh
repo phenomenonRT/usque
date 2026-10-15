@@ -6,10 +6,14 @@
 # успешном подключении тоннеля.
 #
 # Способ подключения (profile):
-#   auto   — перебирать способы, пока один не заработает (по умолчанию)
+#   auto   — клиентский обход ТСПУ: usque сам перебирает адреса, порты и SNI
+#            Cloudflare (--bypass), пока один не заработает (по умолчанию)
 #   quic   — HTTP/3 (QUIC, UDP), порт connect_port или 443
 #   h2     — HTTP/2 (TCP), порт connect_port или 443
 #   manual — как заданы http2 и connect_port
+#
+# Опция bypass=1 включает обход ТСПУ и для явных способов quic/h2/manual:
+# в этом случае usque перебирает комбинации, не ограничиваясь одним портом.
 
 [ -n "$INCLUDE_ONLY" ] || {
 	. /lib/functions.sh
@@ -21,14 +25,15 @@ USQUE_BIN=/usr/bin/usque
 USQUE_HOOK=/usr/lib/usque/netifd-hook.sh
 USQUE_RUN=/usr/lib/usque/run.sh
 USQUE_STATE=/var/run/usque
-USQUE_PERSIST=/etc/usque
 USQUE_DEFAULT_SNI=consumer-masque.cloudflareclient.com
 USQUE_DEFAULT_H2_V4=162.159.198.2
 
-# порядок перебора в режиме auto после порта пользователя и последнего удачного способа;
-# порты — по документации Cloudflare (WARP: firewall): UDP 443 основной, запасные
-# UDP 4443 8443 500 4500 1701 8095, HTTP/2 — TCP 443
-USQUE_AUTO_ORDER="quic:443 h2:443 quic:4443 quic:8443 quic:500 quic:4500 quic:1701 quic:8095"
+# Подсети Cloudflare WARP/MASQUE, которые в режиме обхода уводятся мимо тоннеля
+# (напрямую через прежний шлюз). Иначе после подъёма интерфейса перебор адресов
+# ушёл бы сам в себя. Список должен покрывать пул из internal/bypass.go
+# (BypassCIDRsV4 / BypassCIDRsV6) — держите их в синхроне.
+USQUE_BYPASS_V4_CIDRS="162.159.192.0/24 162.159.193.0/24 162.159.195.0/24 162.159.197.0/24 162.159.198.0/24 162.159.204.0/24"
+USQUE_BYPASS_V6_CIDRS="2606:4700:102::/48"
 
 proto_usque_init_config() {
 	# своего устройства у протокола нет: его создаёт usque, имя usque-<интерфейс>
@@ -53,6 +58,7 @@ proto_usque_init_config() {
 	proto_config_add_int "initial_packet_size"
 	proto_config_add_boolean "insecure"
 	proto_config_add_int "connect_timeout"
+	proto_config_add_boolean "bypass"
 	proto_config_add_string "args"
 }
 
@@ -123,30 +129,56 @@ usque_endpoint_ip() {
 	echo "$val"
 }
 
-# маршрут до эндпоинта через прежний шлюз, чтобы тоннель не ушёл сам в себя
-usque_pin_endpoint() {
-	local interface="$1" ep="$2" fam="-4" r dev gw
-	case "$ep" in *:*) fam="-6" ;; esac
+# маршрут до эндпоинта через прежний шлюз, чтобы тоннель не ушёл сам в себя.
+# Все добавленные маршруты пишутся в <интерфейс>.routes и снимаются в usque_unpin.
+usque_pin_route() { # интерфейс семейство назначение
+	local interface="$1" fam="$2" dest="$3" r dev gw
+	[ -n "$interface" ] || return 1
 
-	r="$(ip $fam route get "$ep" 2>/dev/null | head -n 1)"
+	r="$(ip $fam route get "${dest%%/*}" 2>/dev/null | head -n 1)"
 	dev="$(echo "$r" | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
 	gw="$(echo "$r" | sed -n 's/.* via \([^ ]*\).*/\1/p')"
 	[ -n "$dev" ] || return 1
 
 	if [ -n "$gw" ]; then
-		ip $fam route replace "$ep" via "$gw" dev "$dev" || return 1
+		ip $fam route replace "$dest" via "$gw" dev "$dev" || return 1
 	else
-		ip $fam route replace "$ep" dev "$dev" || return 1
+		ip $fam route replace "$dest" dev "$dev" || return 1
 	fi
-	echo "$fam $ep" > "$USQUE_STATE/$interface.route"
+	printf '%s %s\n' "$fam" "$dest" >> "$USQUE_STATE/$interface.routes"
+}
+
+# маршрут до конкретного адреса сервера
+usque_pin_endpoint() { # интерфейс ep
+	local interface="$1" ep="$2" fam="-4"
+	case "$ep" in *:*) fam="-6" ;; esac
+	usque_pin_route "$interface" "$fam" "$ep"
+}
+
+# в режиме обхода уводим мимо тоннеля весь пул адресов Cloudflare, чтобы
+# перебор работал и после подъёма интерфейса (см. USQUE_BYPASS_*_CIDRS)
+usque_pin_bypass() { # интерфейс v6
+	local interface="$1" v6="$2" cidr
+	if [ "$v6" = 1 ]; then
+		for cidr in $USQUE_BYPASS_V6_CIDRS; do
+			usque_pin_route "$interface" "-6" "$cidr" ||
+				logger -t usque "$interface: не удалось закрепить $cidr"
+		done
+	else
+		for cidr in $USQUE_BYPASS_V4_CIDRS; do
+			usque_pin_route "$interface" "-4" "$cidr" ||
+				logger -t usque "$interface: не удалось закрепить $cidr"
+		done
+	fi
 }
 
 usque_unpin() {
-	local interface="$1" fam ep
-	if [ -r "$USQUE_STATE/$interface.route" ]; then
-		read -r fam ep < "$USQUE_STATE/$interface.route"
-		[ -n "$ep" ] && ip $fam route del "$ep" 2>/dev/null
-		rm -f "$USQUE_STATE/$interface.route"
+	local interface="$1" fam dest
+	if [ -r "$USQUE_STATE/$interface.routes" ]; then
+		while read -r fam dest; do
+			[ -n "$dest" ] && ip $fam route del "$dest" 2>/dev/null
+		done < "$USQUE_STATE/$interface.routes"
+		rm -f "$USQUE_STATE/$interface.routes"
 	fi
 }
 
@@ -154,25 +186,12 @@ usque_cleanup() {
 	local interface="$1"
 	usque_unpin "$interface"
 	rm -f "$USQUE_STATE/$interface.up" "$USQUE_STATE/$interface.cur" \
-		"$USQUE_STATE/$interface.pid" "$USQUE_STATE/$interface.json"
+		"$USQUE_STATE/$interface.pid" "$USQUE_STATE/$interface.json" \
+		"$USQUE_STATE/$interface.routes"
 }
 
-# способы для режима auto: порт пользователя, последний удачный, затем общий порядок
-usque_auto_candidates() {
-	local interface="$1" port="$2" first="" last=""
-	[ -n "$port" ] && first="quic:$port"
-	[ -r "$USQUE_PERSIST/last-$interface" ] && last="$(head -n 1 "$USQUE_PERSIST/last-$interface")"
-	echo "$first $last $USQUE_AUTO_ORDER" | tr ' ' '\n' |
-		grep -E '^(quic|h2):[0-9]+$' | awk '!seen[$0]++' | tr '\n' ' '
-}
-
-# запомнить удачный способ (на флеш пишем только при изменении)
-usque_remember() {
-	local f="$USQUE_PERSIST/last-$1"
-	[ "$(cat "$f" 2>/dev/null)" = "$2" ] && return 0
-	mkdir -p "$USQUE_PERSIST"
-	echo "$2" > "$f"
-}
+# запомнить удачный способ больше не нужно: в режиме auto usque перебирает
+# комбинации сам и держит победителя в памяти на время работы процесса.
 
 usque_fail() { # интерфейс КОД
 	logger -t usque "$1: $2"
@@ -184,12 +203,12 @@ proto_usque_setup() {
 	local interface="$1"
 	local config profile endpoint endpoint_h2 defaultroute metric mtu connect_port sni http2 ipv6
 	local tunnel_ipv4 tunnel_ipv6 keepalive reconnect_delay initial_packet_size
-	local insecure connect_timeout args
-	local ifname cfg cands c m p ep tmo i pid
+	local insecure connect_timeout bypass args
+	local ifname cfg use_bypass cands c m p ep ep_h2 tmo i pid
 
 	json_get_vars config profile endpoint endpoint_h2 defaultroute metric mtu connect_port sni \
 		http2 ipv6 tunnel_ipv4 tunnel_ipv6 keepalive reconnect_delay initial_packet_size \
-		insecure connect_timeout args
+		insecure connect_timeout bypass args
 
 	[ -n "$config" ] || config=/etc/usque/config.json
 	[ -n "$profile" ] || profile=auto
@@ -197,6 +216,12 @@ proto_usque_setup() {
 	[ -n "$mtu" ] || mtu=1280
 	[ -n "$tunnel_ipv4" ] || tunnel_ipv4=1
 	[ -n "$tunnel_ipv6" ] || tunnel_ipv6=1
+
+	# «Авто» всегда включает клиентский обход ТСПУ; опция bypass=1 включает его и
+	# для явных способов quic/h2/manual.
+	use_bypass=0
+	case "$profile" in auto) use_bypass=1 ;; esac
+	[ "$bypass" = 1 ] && use_bypass=1
 
 	ifname="usque-$interface"
 	[ "${#ifname}" -le 15 ] || { usque_fail "$interface" IFNAME_TOO_LONG; return 1; }
@@ -221,32 +246,36 @@ proto_usque_setup() {
 	if [ "$tunnel_ipv4" = 1 ]; then proto_export "USQUE_NO_IPV4=0"; else proto_export "USQUE_NO_IPV4=1"; fi
 	if [ "$tunnel_ipv6" = 1 ]; then proto_export "USQUE_NO_IPV6=0"; else proto_export "USQUE_NO_IPV6=1"; fi
 
-	case "$profile" in
-	quic) cands="quic:${connect_port:-443}" ;;
-	h2) cands="h2:${connect_port:-443}" ;;
-	manual)
-		if [ "$http2" = 1 ]; then cands="h2:${connect_port:-443}"; else cands="quic:${connect_port:-443}"; fi
-		;;
-	*) cands="$(usque_auto_candidates "$interface" "$connect_port")" ;;
-	esac
+	# в режиме обхода usque сам перебирает адреса/порты/SNI, поэтому достаточно
+	# одного запуска; иначе пробуем явный способ, заданный profile
+	if [ "$use_bypass" = 1 ]; then
+		cands="bypass"
+	elif [ "$profile" = h2 ] || { [ "$profile" = manual ] && [ "$http2" = 1 ]; }; then
+		cands="h2:${connect_port:-443}"
+	else
+		cands="quic:${connect_port:-443}"
+	fi
 
-	# время ожидания одной попытки; в auto по умолчанию короче, чтобы перебор не затягивался
+	# время ожидания: в режиме обхода usque перебирает комбинации сам, поэтому
+	# ждём весь перебор целиком (по умолчанию 90 с)
 	tmo="$connect_timeout"
 	if [ -z "$tmo" ]; then
-		case "$profile" in
-		quic | h2 | manual) tmo=20 ;;
-		*) tmo=10 ;;
-		esac
+		if [ "$use_bypass" = 1 ]; then tmo=90; else tmo=20; fi
 	fi
 
 	for c in $cands; do
-		m="${c%%:*}"
-		p="${c##*:}"
+		if [ "$c" = bypass ]; then
+			m=bypass
+			p="${connect_port:-443}"
+		else
+			m="${c%%:*}"
+			p="${c##*:}"
+		fi
 
 		usque_unpin "$interface"
 		rm -f "$USQUE_STATE/$interface.up"
 
-		ep="$(usque_endpoint_ip "$cfg" "$ipv6" "$m")"
+		ep="$(usque_endpoint_ip "$cfg" "$ipv6" "$([ "$m" = h2 ] && echo h2 || echo quic)")"
 		if [ "$defaultroute" = 1 ]; then
 			if [ -n "$ep" ]; then
 				usque_pin_endpoint "$interface" "$ep" ||
@@ -254,12 +283,21 @@ proto_usque_setup() {
 			else
 				logger -t usque "$interface: в $config нет адреса эндпоинта"
 			fi
+			if [ "$use_bypass" = 1 ]; then
+				# в обходе участвует и HTTP/2-адрес сервера
+				ep_h2="$(usque_endpoint_ip "$cfg" "$ipv6" h2)"
+				if [ -n "$ep_h2" ] && [ "$ep_h2" != "$ep" ]; then
+					usque_pin_endpoint "$interface" "$ep_h2"
+				fi
+				usque_pin_bypass "$interface" "$ipv6"
+			fi
 		fi
 
 		printf 'mode=%s\nport=%s\nendpoint=%s\nsni=%s\nprofile=%s\n' \
 			"$m" "$p" "$ep" "${sni:-$USQUE_DEFAULT_SNI}" "$profile" > "$USQUE_STATE/$interface.cur"
 
 		set -- -c "$cfg" nativetun -n "$ifname" -I -m "$mtu" -P "$p"
+		[ "$use_bypass" = 1 ] && set -- "$@" --bypass
 		[ "$m" = h2 ] && set -- "$@" --http2
 		[ -n "$sni" ] && set -- "$@" -s "$sni"
 		[ "$ipv6" = 1 ] && set -- "$@" -6
@@ -284,7 +322,6 @@ proto_usque_setup() {
 		i=0
 		while [ "$i" -lt "$tmo" ]; do
 			[ -e "$USQUE_STATE/$interface.up" ] && {
-				usque_remember "$interface" "$c"
 				logger -t usque "$interface: подключено ($m, порт $p)"
 				return 0
 			}
@@ -297,7 +334,7 @@ proto_usque_setup() {
 			i=$((i + 1))
 		done
 
-		logger -t usque "$interface: $m:$p не сработал"
+		logger -t usque "$interface: $m не сработал"
 		proto_kill_command "$interface"
 		sleep 1
 	done

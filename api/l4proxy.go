@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
@@ -18,6 +19,8 @@ import (
 const (
 	defaultL4ConnectTimeout    = 15 * time.Second
 	defaultL4ConnectRetryCount = 2
+	// defaultL4CandidateTimeout bounds a single endpoint attempt while rotating.
+	defaultL4CandidateTimeout = 4 * time.Second
 )
 
 // DNSResolver resolves a hostname for L4Proxy local DNS mode.
@@ -36,6 +39,11 @@ type L4ProxyConfig struct {
 	OnDisconnect      func(target string)
 	ConnectTimeout    time.Duration
 	ConnectRetryCount int
+	// Candidates, when non-empty, enables endpoint/SNI rotation (DPI bypass).
+	// Every candidate must carry a *net.UDPAddr endpoint (L4 is HTTP/3 only).
+	Candidates []TunnelCandidate
+	// CandidateTimeout bounds a single candidate attempt during rotation.
+	CandidateTimeout time.Duration
 }
 
 // L4Proxy opens one HTTP/3 CONNECT stream for each proxied TCP connection.
@@ -49,6 +57,9 @@ type L4Proxy struct {
 	onDisconnect      func(target string)
 	connectTimeout    time.Duration
 	connectRetryCount int
+	candidates        []TunnelCandidate
+	candidateTimeout  time.Duration
+	candidateIdx      atomic.Uint32
 	connMu            sync.Mutex
 	client            *l4HTTP3Client
 	dialFn            func(context.Context, string) (*l4TCPConn, error)
@@ -62,10 +73,10 @@ type l4HTTP3Client struct {
 
 // NewL4Proxy creates an L4 proxy dialer from a configuration struct.
 func NewL4Proxy(cfg L4ProxyConfig) (*L4Proxy, error) {
-	if cfg.TLSConfig == nil {
+	if cfg.TLSConfig == nil && len(cfg.Candidates) == 0 {
 		return nil, fmt.Errorf("missing TLS config")
 	}
-	if cfg.Endpoint == nil {
+	if cfg.Endpoint == nil && len(cfg.Candidates) == 0 {
 		return nil, fmt.Errorf("missing HTTP/3 UDP endpoint")
 	}
 	if cfg.ResolveLocally && cfg.DNSResolver == nil {
@@ -76,6 +87,14 @@ func NewL4Proxy(cfg L4ProxyConfig) (*L4Proxy, error) {
 	}
 	if cfg.ConnectRetryCount <= 0 {
 		cfg.ConnectRetryCount = defaultL4ConnectRetryCount
+	}
+	for _, cand := range cfg.Candidates {
+		if _, ok := cand.Endpoint.(*net.UDPAddr); !ok {
+			return nil, fmt.Errorf("l4 candidate %q requires a UDP endpoint", cand.Label)
+		}
+	}
+	if len(cfg.Candidates) > 0 && cfg.CandidateTimeout <= 0 {
+		cfg.CandidateTimeout = defaultL4CandidateTimeout
 	}
 
 	proxy := &L4Proxy{
@@ -88,17 +107,40 @@ func NewL4Proxy(cfg L4ProxyConfig) (*L4Proxy, error) {
 		onDisconnect:      cfg.OnDisconnect,
 		connectTimeout:    cfg.ConnectTimeout,
 		connectRetryCount: cfg.ConnectRetryCount,
+		candidates:        cfg.Candidates,
+		candidateTimeout:  cfg.CandidateTimeout,
 	}
 	proxy.dialFn = proxy.dial
 	return proxy, nil
 }
 
+// dialCandidates returns the effective endpoint list. When no bypass candidates
+// were configured, the single TLSConfig/Endpoint pair is used.
+func (p *L4Proxy) dialCandidates() []TunnelCandidate {
+	if len(p.candidates) > 0 {
+		return p.candidates
+	}
+	if p.endpoint == nil || p.tlsConfig == nil {
+		return nil
+	}
+	return []TunnelCandidate{{
+		TLSConfig: p.tlsConfig,
+		Endpoint:  p.endpoint,
+		Label:     p.endpoint.String(),
+	}}
+}
+
+// nextCandidateIdx returns a rotating index across the candidate list.
+func (p *L4Proxy) nextCandidateIdx() uint32 {
+	return p.candidateIdx.Add(1) - 1
+}
+
 // DialContext connects target over an L4 MASQUE HTTP/3 CONNECT stream.
 func (p *L4Proxy) DialContext(ctx context.Context, target string) (net.Conn, error) {
-	if p == nil || p.tlsConfig == nil {
-		return nil, fmt.Errorf("missing TLS config")
+	if p == nil || p.dialFn == nil {
+		return nil, fmt.Errorf("missing dialer")
 	}
-	if p.endpoint == nil {
+	if p.endpoint == nil && len(p.candidates) == 0 {
 		return nil, fmt.Errorf("missing HTTP/3 UDP endpoint")
 	}
 	target, err := p.resolveTarget(ctx, target)
@@ -234,36 +276,72 @@ func (p *L4Proxy) getOrCreateClientConn(ctx context.Context) (*l4HTTP3Client, er
 	}
 	p.connMu.Unlock()
 
-	udpConn, err := listenUDPForEndpoint(p.endpoint)
-	if err != nil {
-		return nil, err
-	}
-	// without ConnectionIDLength set, backend occasionally throws PROTOCOL_VIOLATION
-	// and that closes our connection
-	qtr := &quic.Transport{Conn: udpConn, ConnectionIDLength: 20}
-	quicConn, err := qtr.Dial(ctx, p.endpoint, p.tlsConfig, p.quicConfig)
-	if err != nil {
-		_ = udpConn.Close()
-		return nil, err
+	candidates := p.dialCandidates()
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("missing HTTP/3 UDP endpoint")
 	}
 
-	newClient := &l4HTTP3Client{
-		udpConn:    udpConn,
-		quicConn:   quicConn,
-		clientConn: (&http3.Transport{}).NewClientConn(quicConn),
+	var lastErr error
+	for range candidates {
+		cand := candidates[p.nextCandidateIdx()%uint32(len(candidates))]
+		endpoint, ok := cand.Endpoint.(*net.UDPAddr)
+		if !ok || endpoint == nil {
+			lastErr = fmt.Errorf("candidate %q is not a UDP endpoint", cand.Label)
+			continue
+		}
+
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		if p.candidateTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, p.candidateTimeout)
+		}
+
+		udpConn, err := listenUDPForEndpoint(endpoint)
+		if err == nil {
+			// without ConnectionIDLength set, backend occasionally throws PROTOCOL_VIOLATION
+			// and that closes our connection
+			qtr := &quic.Transport{Conn: udpConn, ConnectionIDLength: 20}
+			var quicConn *quic.Conn
+			quicConn, err = qtr.Dial(attemptCtx, endpoint, cand.TLSConfig, p.quicConfig)
+			if err != nil {
+				_ = udpConn.Close()
+			} else {
+				if cancel != nil {
+					cancel()
+				}
+				newClient := &l4HTTP3Client{
+					udpConn:    udpConn,
+					quicConn:   quicConn,
+					clientConn: (&http3.Transport{}).NewClientConn(quicConn),
+				}
+
+				p.connMu.Lock()
+				if p.client != nil {
+					current := p.client
+					p.connMu.Unlock()
+					closeL4HTTP3(newClient.udpConn, newClient.quicConn)
+					return current, nil
+				}
+				p.client = newClient
+				p.connMu.Unlock()
+
+				return newClient, nil
+			}
+		}
+		if cancel != nil {
+			cancel()
+		}
+
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 	}
 
-	p.connMu.Lock()
-	if p.client != nil {
-		current := p.client
-		p.connMu.Unlock()
-		closeL4HTTP3(newClient.udpConn, newClient.quicConn)
-		return current, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no connection candidates")
 	}
-	p.client = newClient
-	p.connMu.Unlock()
-
-	return newClient, nil
+	return nil, lastErr
 }
 
 func (p *L4Proxy) closeClientConnIfCurrent(expected *l4HTTP3Client) {

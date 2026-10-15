@@ -29,12 +29,6 @@ var portFwCmd = &cobra.Command{
 			return
 		}
 
-		sni, err := cmd.Flags().GetString("sni-address")
-		if err != nil {
-			cmd.Printf("Failed to get SNI address: %v\n", err)
-			return
-		}
-
 		privKey, err := config.AppConfig.GetEcPrivateKey()
 		if err != nil {
 			cmd.Printf("Failed to get private key: %v\n", err)
@@ -58,20 +52,9 @@ var portFwCmd = &cobra.Command{
 			return
 		}
 
-		tlsConfig, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, sni, insecure)
-		if err != nil {
-			cmd.Printf("Failed to prepare TLS config: %v\n", err)
-			return
-		}
-
 		keepalivePeriod, err := cmd.Flags().GetDuration("keepalive-period")
 		if err != nil {
 			cmd.Printf("Failed to get keepalive period: %v\n", err)
-			return
-		}
-		initialPacketSize, err := cmd.Flags().GetUint16("initial-packet-size")
-		if err != nil {
-			cmd.Printf("Failed to get initial packet size: %v\n", err)
 			return
 		}
 
@@ -93,9 +76,9 @@ var portFwCmd = &cobra.Command{
 			return
 		}
 
-		endpoint, err := config.SelectEndpointFromConfig(useHTTP2, useIPv6, connectPort)
+		plan, err := buildTunnelPlan(cmd, privKey, peerPubKey, cert, useHTTP2, useIPv6, connectPort)
 		if err != nil {
-			cmd.Printf("Failed to select endpoint: %v\n", err)
+			cmd.Printf("Failed to prepare tunnel: %v\n", err)
 			return
 		}
 
@@ -103,8 +86,10 @@ var portFwCmd = &cobra.Command{
 			config.WarnInsecure()
 		}
 
-		if useHTTP2 {
-			config.LogHTTP2Endpoint(endpoint)
+		if len(plan.Candidates) > 0 {
+			log.Printf("Обход ТСПУ включён: %d комбинаций адрес/порт/SNI, таймаут одной попытки %s", len(plan.Candidates), plan.ConnectTimeout)
+		} else if useHTTP2 {
+			config.LogHTTP2Endpoint(plan.Endpoint)
 		}
 
 		tunnelIPv4, err := cmd.Flags().GetBool("no-tunnel-ipv4")
@@ -250,15 +235,18 @@ var portFwCmd = &cobra.Command{
 		defer func() { _ = tunDev.Close() }()
 
 		go api.MaintainTunnel(context.Background(), api.MaintainTunnelConfig{
-			TLSConfig:         tlsConfig,
+			TLSConfig:         plan.TLSConfig,
 			KeepalivePeriod:   keepalivePeriod,
-			InitialPacketSize: initialPacketSize,
-			Endpoint:          endpoint,
+			InitialPacketSize: plan.InitialPacketSize,
+			Endpoint:          plan.Endpoint,
 			Device:            api.NewNetstackAdapter(tunDev),
 			MTU:               mtu,
 			ReconnectDelay:    reconnectDelay,
 			AlwaysReconnect:   alwaysReconnect,
 			UseHTTP2:          useHTTP2,
+			Candidates:        plan.Candidates,
+			Fragment:          plan.Fragment,
+			ConnectTimeout:    plan.ConnectTimeout,
 			OnConnect:         onConnect,
 			OnDisconnect:      onDisconnect,
 			HookEnv:           hookEnv,
@@ -419,5 +407,6 @@ func init() {
 	portFwCmd.Flags().Bool("dont-always-reconnect", false, "Disable always reconnect in portfw; reconnect only when new activity arrives")
 	portFwCmd.Flags().String("on-connect", "", "Path to an executable to run after each successful tunnel connect (no args; context via USQUE_* env vars)")
 	portFwCmd.Flags().String("on-disconnect", "", "Path to an executable to run after each tunnel disconnect (no args; context via USQUE_* env vars)")
+	addBypassFlags(portFwCmd)
 	rootCmd.AddCommand(portFwCmd)
 }

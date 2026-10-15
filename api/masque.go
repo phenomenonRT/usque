@@ -99,6 +99,7 @@ func PrepareTlsConfig(privKey *ecdsa.PrivateKey, peerPubKey *ecdsa.PublicKey, ce
 //   - connectUri: string - The URI template for the Connect-IP request.
 //   - endpoint: net.Addr - The remote endpoint (*net.UDPAddr for HTTP/3, *net.TCPAddr for HTTP/2).
 //   - useHTTP2: bool - When true, connect over TCP+TLS/HTTP2 instead of QUIC/HTTP3.
+//   - fragment: *TLSFragmentConfig - Optional TCP/TLS ClientHello fragmentation for DPI bypass (HTTP/2 only).
 //
 // Returns:
 //   - *net.UDPConn: The UDP connection used for the QUIC session (nil in HTTP/2 mode).
@@ -106,7 +107,7 @@ func PrepareTlsConfig(privKey *ecdsa.PrivateKey, peerPubKey *ecdsa.PublicKey, ce
 //   - *connectip.Conn: The Connect-IP connection instance.
 //   - *http.Response: The response from the Connect-IP handshake.
 //   - error: An error if the connection setup fails.
-func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, connectUri string, endpoint net.Addr, useHTTP2 bool) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, connectUri string, endpoint net.Addr, useHTTP2 bool, fragment *TLSFragmentConfig) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
 	template := uritemplate.MustNew(connectUri)
 	additionalHeaders := http.Header{
 		"User-Agent": []string{""},
@@ -123,7 +124,7 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 		// TODO: support PQC
 		h2Headers.Set("pq-enabled", "false")
 
-		h2Client, err := newHTTP2Client(tlsConfig, h2Endpoint, connectUri)
+		h2Client, err := newHTTP2Client(tlsConfig, h2Endpoint, connectUri, fragment)
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("failed to create HTTP/2 client: %w", err)
 		}
@@ -222,7 +223,9 @@ func isRetryableHTTP3ConnectFailure(err error) bool {
 
 // newHTTP2Client builds an HTTP client for CONNECT-IP over HTTP/2.
 // It honors proxy environment variables and pins dialing to the selected endpoint.
-func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI string) (*http.Client, error) {
+// When fragment is enabled, the raw TCP connection is wrapped so the TLS
+// ClientHello leaves in multiple TCP segments (DPI bypass).
+func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI string, fragment *TLSFragmentConfig) (*http.Client, error) {
 	if endpoint == nil {
 		return nil, errors.New("missing HTTP/2 endpoint")
 	}
@@ -246,7 +249,7 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 					return nil, err
 				}
 
-				tlsConn := tls.Client(conn, tlsConfig)
+				tlsConn := tls.Client(wrapTLSFragment(conn, fragment), tlsConfig)
 				if err := tlsConn.HandshakeContext(ctx); err != nil {
 					_ = conn.Close()
 					return nil, err
@@ -257,7 +260,6 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 
 		return &http.Client{Transport: transport}, nil
 	}
-
 	originAuthority := authorityWithDefaultPort(parsedURI, "443")
 	proxyAuthority := authorityWithDefaultPort(proxyURL, proxyDefaultPort(proxyURL))
 	dialer := &net.Dialer{}
@@ -275,15 +277,21 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialAddr := addr
 			dialTLSConfig := tlsConfig
+			fragmentOrigin := false
 			if addr == proxyAuthority && proxyURL != nil {
 				dialTLSConfig = &tls.Config{ServerName: proxyURL.Hostname()}
 			} else if addr == originAuthority {
 				dialAddr = endpoint.String()
+				fragmentOrigin = true
 			}
 
 			conn, err := dialer.DialContext(ctx, network, dialAddr)
 			if err != nil {
 				return nil, err
+			}
+
+			if fragmentOrigin {
+				conn = wrapTLSFragment(conn, fragment)
 			}
 
 			tlsConn := tls.Client(conn, dialTLSConfig)

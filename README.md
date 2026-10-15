@@ -566,6 +566,30 @@ As a starting point, you can reach out to the [`api/`](api/) package. For exampl
 
 There is hardly a way to distinguish MASQUE traffic from other HTTP/3 traffic. However QUIC mandates TLS v1.3 so we send a ClientHello with `client-masque.cloudflareclient.com` in the SNI field. Some firewalls may block this. You can change the SNI by specifying `-s` flag to any domain *(based on my experience)* and the connection will still work. Please note that this is definitely not Cloudflare's intended use case *(just a nice side effect)*. And before doing any circumvention attempts, you should make sure you are not breaking any laws. Personally I only see this as a clear benefit for masking the fact that we are connecting to Warp from MiTMers.
 
+#### Automatic DPI bypass (`--bypass`)
+
+TSPU (the Russian DPI system) and similar middleboxes do not only match on the SNI. They can drop QUIC (UDP), specific ports, the known WARP endpoints or the whole handshake pattern. To counter this, the tunnel commands (`socks`, `http-proxy`, `nativetun`, `portfw`, and the L4 proxies) accept an opt-in `--bypass` flag that rotates through connection parameters on the client only. **Nothing is changed in the MASQUE protocol or on the Cloudflare side.**
+
+```sh
+usque --config config.json nativetun --bypass -n usque0
+```
+
+When `--bypass` is set, the client tries the following combinations until one connects, remembers the winner and prefers it on reconnect:
+
+1. **Port sweep** — the configured server address with the standard port first (443) and the documented fallbacks (`500`, `1701`, `4500`, `4443`, `8443`, `8095`) after it.
+2. **SNI sweep** — alternative names in the TLS handshake (`zt-masque.cloudflareclient.com`, `one.one.one.one`, `www.cloudflare.com`). Passing `-s` disables the sweep and pins your own name.
+3. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses (`162.159.197.0/24`, `162.159.192.1`, `162.159.193.1`, `162.159.195.1`, `162.159.204.1`, …).
+4. **Address × SNI pairs** for the remaining combinations.
+
+Additional knobs:
+
+- `--bypass-endpoint <ip>` (repeatable) — add your own server addresses to the end of the sweep.
+- `--tls-fragment` / `--tls-fragment-sizes` — for HTTP/2 candidates, split the TLS ClientHello into separate TCP segments so a middlebox cannot see the handshake in one packet (default: 1 byte, then the rest).
+- `--connect-timeout` — bound a single candidate attempt (default `5s`), so silently dropped addresses are skipped quickly.
+- In bypass mode the initial QUIC packet is capped at 1200 bytes, which disables PMTU probing with large packets that are often dropped silently.
+
+On OpenWrt the `auto` profile enables `--bypass` automatically and pins the Cloudflare ranges outside the tunnel; see [`_docs/openwrt.md`](_docs/openwrt.md#41-настройка-обхода-блокировок-тспу).
+
 ## Should I replace WireGuard with this?
 
 That depends on your needs. 😊 WireGuard is a great protocol and its modern/fast cryptography plus the ability to have kernel mode support are both great things. If it works for you, I don't believe you should switch.

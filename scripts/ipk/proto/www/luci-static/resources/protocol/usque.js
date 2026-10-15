@@ -35,6 +35,7 @@ function cfgPath(sid) {
 }
 
 function modeName(mode) {
+	if (mode == 'bypass') return 'обход ТСПУ (перебор адресов)';
 	return mode == 'h2' ? 'HTTP/2 (TCP)' : 'HTTP/3 QUIC (UDP)';
 }
 
@@ -43,7 +44,7 @@ function profileName(p) {
 	case 'quic': return 'только QUIC';
 	case 'h2': return 'только HTTP/2';
 	case 'manual': return 'вручную';
-	default: return 'авто';
+	default: return 'авто (обход ТСПУ)';
 	}
 }
 
@@ -274,8 +275,8 @@ return network.registerProtocol('usque', {
 		/* ---------- Основные: способ подключения ---------- */
 
 		o = s.taboption('general', form.ListValue, 'profile', _('Способ подключения'),
-			_('Если сеть блокирует или режет QUIC (UDP), «Авто» сам попробует HTTP/2 по TCP 443 и запасные порты Cloudflare и запомнит рабочий вариант.'));
-		o.value('auto', _('Авто — подобрать рабочий способ (рекомендуется)'));
+			_('«Авто» включает обход ТСПУ: usque сам перебирает адреса, порты и SNI Cloudflare, пока соединение не поднимется. Ничего в сервере Cloudflare при этом не меняется.'));
+		o.value('auto', _('Авто — обход ТСПУ, подобрать рабочую комбинацию (рекомендуется)'));
 		o.value('quic', _('QUIC / HTTP/3 (UDP)'));
 		o.value('h2', _('HTTP/2 (TCP 443) — если UDP режется'));
 		o.value('manual', _('Вручную (параметры ниже)'));
@@ -283,7 +284,7 @@ return network.registerProtocol('usque', {
 		o.rmempty = false;
 
 		o = s.taboption('general', form.Value, 'connect_port', _('Порт сервера (UDP)'),
-			_('Порты MASQUE по документации Cloudflare: основной 443, запасные 4443, 8443, 500, 4500, 1701, 8095. Для HTTP/2 используется TCP 443. В режиме «Авто» этот порт пробуется первым.'));
+			_('Порт, который пробуется первым (основной 443; запасные 4443, 8443, 500, 4500, 1701, 8095). В режиме обхода usque затем сам перебирает и остальные порты, и SNI, и адреса сервера.'));
 		o.value('443', '443 — основной');
 		o.value('4443', '4443');
 		o.value('8443', '8443');
@@ -296,7 +297,7 @@ return network.registerProtocol('usque', {
 		o.optional = true;
 
 		o = s.taboption('general', form.Value, 'sni', _('SNI (имя в TLS-рукопожатии)'),
-			_('Автор usque пишет, что можно указать любое имя — соединение всё равно работает. Если сеть режет стандартное имя, попробуйте другое. Пусто — consumer-masque.cloudflareclient.com.'));
+			_('Пусто — usque в режиме обхода сам перебирает стандартное имя и запасные. Если задать своё, перебор SNI отключается и используется только оно.'));
 		o.value('consumer-masque.cloudflareclient.com', 'consumer-masque.cloudflareclient.com — стандартный');
 		o.value('zt-masque.cloudflareclient.com', 'zt-masque.cloudflareclient.com — рекомендует автор usque');
 		o.value('www.cloudflare.com', 'www.cloudflare.com — обычный сайт');
@@ -305,7 +306,7 @@ return network.registerProtocol('usque', {
 		o.optional = true;
 
 		o = s.taboption('general', form.Value, 'endpoint', _('Адрес сервера Cloudflare (QUIC)'),
-			_('IP, к которому идёт QUIC. Пусто — адрес из config.json. Для MASQUE Cloudflare указывает сеть 162.159.197.0/24.'));
+			_('IP, к которому идёт QUIC. Пусто — адрес из config.json. В режиме обхода пробуется первым, затем запасные адреса Cloudflare. Для MASQUE Cloudflare указывает сеть 162.159.197.0/24.'));
 		o.datatype = 'ipaddr';
 		o.optional = true;
 		withConfigHint(o, function(self, info) {
@@ -313,7 +314,7 @@ return network.registerProtocol('usque', {
 		});
 
 		o = s.taboption('general', form.Value, 'endpoint_h2', _('Адрес сервера Cloudflare (HTTP/2)'),
-			_('IP, к которому идёт HTTP/2 по TCP. Пусто — адрес из config.json (по умолчанию 162.159.198.2).'));
+			_('IP, к которому идёт HTTP/2 по TCP. Пусто — адрес из config.json (по умолчанию 162.159.198.2). В режиме обхода пробуется вместе с остальными.'));
 		o.datatype = 'ipaddr';
 		o.optional = true;
 		withConfigHint(o, function(self, info) {
@@ -366,15 +367,23 @@ return network.registerProtocol('usque', {
 		};
 
 		o = s.taboption('advanced', form.Value, 'initial_packet_size', _('Размер первого пакета'),
-			_('Размер первого QUIC-пакета в байтах. Пусто — автоподбор.'));
+			_('Размер первого QUIC-пакета в байтах. Пусто — авто. В режиме обхода по умолчанию используется безопасный 1200.'));
 		o.datatype = 'range(1200,1500)';
 		o.placeholder = _('авто');
 		o.optional = true;
 
+		o = s.taboption('advanced', form.Flag, 'bypass', _('Обход ТСПУ и для выбранного способа'),
+			_('«Авто» включает обход всегда. Включите здесь, чтобы и при явном способе usque перебирал адреса, порты и SNI Cloudflare и дробил TLS-рукопожатие.'));
+		o.default = o.disabled;
+		o.rmempty = false;
+		o.depends('profile', 'quic');
+		o.depends('profile', 'h2');
+		o.depends('profile', 'manual');
+
 		o = s.taboption('advanced', form.Value, 'connect_timeout', _('Ожидание подключения (секунды)'),
-			_('Сколько ждать тоннель при каждой попытке. Пусто: 10 с в режиме «Авто», 20 с в остальных.'));
+			_('Сколько всего ждать, пока тоннель поднимется. Пусто: 90 с в режиме обхода, 20 с в остальных.'));
 		o.datatype = 'uinteger';
-		o.placeholder = '10';
+		o.placeholder = '90';
 		o.optional = true;
 
 		o = s.taboption('advanced', form.Flag, 'insecure', _('Не проверять сертификат сервера'),

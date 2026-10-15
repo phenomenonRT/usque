@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
 	connectip "github.com/Diniboy1123/connect-ip-go"
 	"github.com/Diniboy1123/usque/internal"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/songgao/water"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -180,6 +182,17 @@ type MaintainTunnelConfig struct {
 	ReconnectDelay    time.Duration
 	AlwaysReconnect   bool
 	UseHTTP2          bool
+	// Candidates, when non-empty, enables client-side bypass: the supervisor
+	// rotates through endpoint/SNI/transport combinations (SNI is carried in
+	// each candidate's TLSConfig) until one connects, and remembers the winner
+	// for subsequent reconnects. TLSConfig/Endpoint/UseHTTP2 are ignored then.
+	Candidates []TunnelCandidate
+	// Fragment optionally splits the TLS ClientHello into several TCP segments
+	// (HTTP/2 candidates only) to evade DPI.
+	Fragment *TLSFragmentConfig
+	// ConnectTimeout bounds a single candidate attempt during rotation. Zero
+	// means no per-candidate timeout (the parent context still applies).
+	ConnectTimeout time.Duration
 	// OnConnect is a path to an executable run after every successful tunnel
 	// connect. It is exec'd directly (no shell, no args) and runs fire-and-forget.
 	OnConnect string
@@ -245,6 +258,144 @@ func closeTunnelDevice(device TunnelDevice) {
 	}
 }
 
+// validateEndpoint ensures the endpoint type matches the selected transport.
+func validateEndpoint(endpoint net.Addr, useHTTP2 bool) {
+	if useHTTP2 {
+		if _, ok := endpoint.(*net.TCPAddr); !ok {
+			log.Fatalf("MaintainTunnel: HTTP/2 mode requires a *net.TCPAddr endpoint, got %T", endpoint)
+		}
+		return
+	}
+	if _, ok := endpoint.(*net.UDPAddr); !ok {
+		log.Fatalf("MaintainTunnel: HTTP/3 mode requires a *net.UDPAddr endpoint, got %T", endpoint)
+	}
+}
+
+// tunnelSession holds an established Connect-IP tunnel and its transports.
+type tunnelSession struct {
+	candidate TunnelCandidate
+	udpConn   *net.UDPConn
+	transport *http3.Transport
+	ipConn    *connectip.Conn
+	response  *http.Response
+}
+
+// close releases every transport owned by the session.
+func (s *tunnelSession) close() {
+	if s == nil {
+		return
+	}
+	if s.ipConn != nil {
+		_ = s.ipConn.Close()
+	}
+	if s.transport != nil {
+		_ = s.transport.Close()
+	}
+	if s.udpConn != nil {
+		_ = s.udpConn.Close()
+	}
+}
+
+// tunnelCandidates returns the effective candidate list. When no bypass
+// candidates were configured, the single TLSConfig/Endpoint pair is used.
+func tunnelCandidates(cfg MaintainTunnelConfig) []TunnelCandidate {
+	if len(cfg.Candidates) > 0 {
+		return cfg.Candidates
+	}
+	label := "config endpoint"
+	if cfg.Endpoint != nil {
+		label = cfg.Endpoint.String()
+	}
+	return []TunnelCandidate{{
+		TLSConfig: cfg.TLSConfig,
+		Endpoint:  cfg.Endpoint,
+		UseHTTP2:  cfg.UseHTTP2,
+		Label:     label,
+	}}
+}
+
+// establishTunnel tries candidates round-robin starting at start until one
+// yields a 200 Connect-IP response. It returns the session and the index of the
+// winning candidate so the caller can prefer it on the next reconnect.
+func establishTunnel(ctx context.Context, cfg MaintainTunnelConfig, cands []TunnelCandidate, start int) (*tunnelSession, int, error) {
+	if len(cands) == 0 {
+		return nil, 0, errors.New("no connection candidates configured")
+	}
+
+	var lastErr error
+	for i := 0; i < len(cands); i++ {
+		idx := (start + i) % len(cands)
+		cand := cands[idx]
+
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		if cfg.ConnectTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
+		}
+
+		log.Printf("Establishing MASQUE connection to %s (%s)", cand.Endpoint, cand.Label)
+		udpConn, tr, ipConn, rsp, err := ConnectTunnel(
+			attemptCtx,
+			cand.TLSConfig,
+			internal.DefaultQuicConfig(cfg.KeepalivePeriod, cfg.InitialPacketSize),
+			internal.ConnectURI,
+			cand.Endpoint,
+			cand.UseHTTP2,
+			cfg.Fragment,
+		)
+		if cancel != nil {
+			cancel()
+		}
+
+		if err != nil {
+			lastErr = err
+			log.Printf("Candidate %s failed: %v", cand.Label, err)
+			closePartialConnection(ipConn, tr, udpConn)
+			if ctx.Err() != nil {
+				return nil, idx, ctx.Err()
+			}
+			continue
+		}
+
+		if rsp == nil || rsp.StatusCode != http.StatusOK {
+			status := "no response"
+			if rsp != nil {
+				status = rsp.Status
+			}
+			lastErr = fmt.Errorf("candidate %s: unexpected status %s", cand.Label, status)
+			log.Printf("Candidate %s rejected: %s", cand.Label, status)
+			closePartialConnection(ipConn, tr, udpConn)
+			if ctx.Err() != nil {
+				return nil, idx, ctx.Err()
+			}
+			continue
+		}
+
+		return &tunnelSession{
+			candidate: cand,
+			udpConn:   udpConn,
+			transport: tr,
+			ipConn:    ipConn,
+			response:  rsp,
+		}, idx, nil
+	}
+
+	return nil, start, lastErr
+}
+
+// closePartialConnection closes whatever transports a failed attempt created.
+func closePartialConnection(ipConn *connectip.Conn, tr *http3.Transport, udpConn *net.UDPConn) {
+	if ipConn != nil {
+		_ = ipConn.Close()
+	}
+	if tr != nil {
+		_ = tr.Close()
+	}
+	if udpConn != nil {
+		_ = udpConn.Close()
+	}
+}
+
 // MaintainTunnel continuously connects to the MASQUE server, then starts two
 // forwarding goroutines: one forwarding from the device to the IP connection (and handling
 // any ICMP reply), and the other forwarding from the IP connection to the device.
@@ -254,15 +405,11 @@ func closeTunnelDevice(device TunnelDevice) {
 //   - ctx: context.Context - The context for the connection.
 //   - cfg: MaintainTunnelConfig - Tunnel maintenance runtime configuration.
 func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
-	if cfg.UseHTTP2 {
-		if _, ok := cfg.Endpoint.(*net.TCPAddr); !ok {
-			log.Fatalf("MaintainTunnel: HTTP/2 mode requires a *net.TCPAddr endpoint, got %T", cfg.Endpoint)
-		}
-	} else {
-		if _, ok := cfg.Endpoint.(*net.UDPAddr); !ok {
-			log.Fatalf("MaintainTunnel: HTTP/3 mode requires a *net.UDPAddr endpoint, got %T", cfg.Endpoint)
-		}
+	candidates := tunnelCandidates(cfg)
+	for _, cand := range candidates {
+		validateEndpoint(cand.Endpoint, cand.UseHTTP2)
 	}
+	startIdx := 0
 
 	// Cancellation must also interrupt blocking TUN reads, including the idle
 	// wait before a connection is established. The concrete adapters close the
@@ -297,52 +444,29 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			log.Printf("Detected outbound activity (%d bytes). Reconnecting...", n)
 		}
 
-		log.Printf("Establishing MASQUE connection to %s", cfg.Endpoint)
-		udpConn, tr, ipConn, rsp, err := ConnectTunnel(
-			ctx,
-			cfg.TLSConfig,
-			internal.DefaultQuicConfig(cfg.KeepalivePeriod, cfg.InitialPacketSize),
-			internal.ConnectURI,
-			cfg.Endpoint,
-			cfg.UseHTTP2,
-		)
+		session, winner, err := establishTunnel(ctx, cfg, candidates, startIdx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("Failed to connect tunnel: %v", err)
-			if ipConn != nil {
-				_ = ipConn.Close()
-			}
-			if tr != nil {
-				_ = tr.Close()
-			}
-			if udpConn != nil {
-				_ = udpConn.Close()
-			}
 			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
 				return
 			}
 			continue
 		}
-		if rsp.StatusCode != 200 {
-			log.Printf("Tunnel connection failed: %s", rsp.Status)
-			_ = ipConn.Close()
-			if tr != nil {
-				_ = tr.Close()
-			}
-			if udpConn != nil {
-				_ = udpConn.Close()
-			}
-			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
-				return
-			}
-			continue
-		}
+		startIdx = winner
 
-		log.Println("Connected to MASQUE server")
+		udpConn := session.udpConn
+		tr := session.transport
+		ipConn := session.ipConn
+
+		log.Printf("Connected to MASQUE server via %s", session.candidate.Label)
 
 		if cfg.OnConnect != "" {
 			env := cloneHookEnv(cfg.HookEnv)
 			env["USQUE_EVENT"] = "connect"
-			env["USQUE_ENDPOINT"] = cfg.Endpoint.String()
+			env["USQUE_ENDPOINT"] = session.candidate.Endpoint.String()
 			RunHook(cfg.OnConnect, env)
 		}
 
@@ -401,7 +525,9 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			for {
 				packet, err := ipConn.ReadPacketZeroCopy(true)
 				if err != nil {
-					if cfg.UseHTTP2 {
+					// In bypass mode the winning candidate picks the transport,
+					// which may differ from the command-level flag.
+					if session.candidate.UseHTTP2 {
 						errChan <- fmt.Errorf("connection closed while reading from IP connection: %w", err)
 						return
 					}
@@ -429,7 +555,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 		if ctx.Err() == nil && cfg.OnDisconnect != "" {
 			env := cloneHookEnv(cfg.HookEnv)
 			env["USQUE_EVENT"] = "disconnect"
-			env["USQUE_ENDPOINT"] = cfg.Endpoint.String()
+			env["USQUE_ENDPOINT"] = session.candidate.Endpoint.String()
 			RunHook(cfg.OnDisconnect, env)
 		}
 

@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"log"
-	"net"
 	"net/netip"
 	"time"
 
@@ -102,21 +101,18 @@ func buildL4Proxy(cmd *cobra.Command, mode string) (l4ProxyOptions, *api.L4Proxy
 	if err != nil {
 		return opts, nil, fmt.Errorf("failed to generate cert: %v", err)
 	}
-	tlsConfig, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, internal.L4ConnectSNI, opts.insecure)
+
+	plan, err := buildL4Plan(cmd, privKey, peerPubKey, cert, opts.useIPv6, opts.connectPort, internal.L4ConnectSNI)
 	if err != nil {
-		return opts, nil, fmt.Errorf("failed to prepare TLS config: %v", err)
+		return opts, nil, fmt.Errorf("failed to prepare L4 tunnel: %v", err)
 	}
 	if opts.insecure {
 		config.WarnInsecure()
 	}
+	opts.initialPacketSize = plan.InitialPacketSize
 
-	endpointAddr, err := config.SelectEndpointFromConfig(false, opts.useIPv6, opts.connectPort)
-	if err != nil {
-		return opts, nil, fmt.Errorf("failed to select endpoint: %v", err)
-	}
-	endpoint, ok := endpointAddr.(*net.UDPAddr)
-	if !ok {
-		return opts, nil, fmt.Errorf("l4 proxy requires an HTTP/3 UDP endpoint")
+	if len(plan.Candidates) > 0 {
+		log.Printf("Обход ТСПУ включён: %d QUIC-комбинаций адрес/порт/SNI, таймаут одной попытки %s", len(plan.Candidates), plan.CandidateTimeout)
 	}
 
 	dnsAddrs, err := parseDNSAddrs(opts.dnsServers)
@@ -137,11 +133,13 @@ func buildL4Proxy(cmd *cobra.Command, mode string) (l4ProxyOptions, *api.L4Proxy
 	}
 
 	proxy, err := api.NewL4Proxy(api.L4ProxyConfig{
-		TLSConfig:      tlsConfig,
-		QUICConfig:     l4QUICConfig(opts.keepalivePeriod, opts.initialPacketSize),
-		Endpoint:       endpoint,
-		DNSResolver:    resolver,
-		ResolveLocally: opts.localDNS,
+		TLSConfig:        plan.TLSConfig,
+		QUICConfig:       l4QUICConfig(opts.keepalivePeriod, opts.initialPacketSize),
+		Endpoint:         plan.Endpoint,
+		Candidates:       plan.Candidates,
+		CandidateTimeout: plan.CandidateTimeout,
+		DNSResolver:      resolver,
+		ResolveLocally:   opts.localDNS,
 		OnConnect: func(target string) {
 			env := cloneHookEnv(hookEnv)
 			env["USQUE_EVENT"] = "connect"
@@ -209,6 +207,7 @@ func addL4ProxyFlags(cmd *cobra.Command, defaultPort, proxyName string) {
 	cmd.Flags().StringArrayP("dns", "d", []string{"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"}, "DNS servers for local proxy name lookups with -l (unless --system-dns)")
 	cmd.Flags().DurationP("dns-timeout", "t", 2*time.Second, "Timeout for DNS queries")
 	cmd.Flags().BoolP("ipv6", "6", false, "Use IPv6 for MASQUE connection")
+	cmd.Flags().StringP("sni-address", "s", internal.L4ConnectSNI, "SNI address to use for MASQUE connection")
 	cmd.Flags().DurationP("keepalive-period", "k", 30*time.Second, "Keepalive period for MASQUE connection")
 	cmd.Flags().Uint16P("initial-packet-size", "i", 0, "Custom initial packet size for MASQUE connection (default: auto with PMTU discovery)")
 	cmd.Flags().Bool("insecure", false, "Disable endpoint certificate pinning and trust any certificate")
@@ -216,4 +215,5 @@ func addL4ProxyFlags(cmd *cobra.Command, defaultPort, proxyName string) {
 	cmd.Flags().Bool("system-dns", false, "Resolve names via the OS (e.g. /etc/resolv.conf) instead of -d")
 	cmd.Flags().String("on-connect", "", "Path to an executable to run after each successful L4 CONNECT stream (no args; context via USQUE_* env vars)")
 	cmd.Flags().String("on-disconnect", "", "Path to an executable to run after each L4 CONNECT stream closes (no args; context via USQUE_* env vars)")
+	addBypassFlags(cmd)
 }

@@ -113,12 +113,13 @@ do_stop() {
 		sleep 1
 		[ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null
 	fi
-	if [ -r "$STATE/$iface.route" ]; then
-		read -r fam ep < "$STATE/$iface.route"
-		[ -n "$ep" ] && ip $fam route del "$ep" 2>/dev/null
+	if [ -r "$STATE/$iface.routes" ]; then
+		while read -r fam ep; do
+			[ -n "$ep" ] && ip $fam route del "$ep" 2>/dev/null
+		done < "$STATE/$iface.routes"
 	fi
 	rm -f "$STATE/$iface.up" "$STATE/$iface.cur" "$STATE/$iface.pid" \
-		"$STATE/$iface.route" "$STATE/$iface.json"
+		"$STATE/$iface.routes" "$STATE/$iface.json"
 	printf '{"ok":true}\n'
 }
 
