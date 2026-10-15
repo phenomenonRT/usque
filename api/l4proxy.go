@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
@@ -47,6 +48,12 @@ type L4ProxyConfig struct {
 	// Parallel keeps that many candidate attempts in flight at once. Values
 	// below two mean sequential attempts.
 	Parallel int
+	// InitialPacketSizeJitter, when positive, adds up to that many random bytes
+	// to the QUIC initial packet size of every attempt (see MaintainTunnelConfig).
+	InitialPacketSizeJitter uint16
+	// OnWinner, when set, is called with the label of a candidate that just
+	// connected, so callers can remember the working combination across restarts.
+	OnWinner func(label string)
 }
 
 // L4Proxy opens one HTTP/3 CONNECT stream for each proxied TCP connection.
@@ -58,11 +65,13 @@ type L4Proxy struct {
 	resolveLocally    bool
 	onConnect         func(target string)
 	onDisconnect      func(target string)
+	onWinner          func(label string)
 	connectTimeout    time.Duration
 	connectRetryCount int
 	candidates        []TunnelCandidate
 	candidateTimeout  time.Duration
 	parallel          int
+	packetSizeJitter  uint16
 	candidateIdx      atomic.Uint32
 	connMu            sync.Mutex
 	client            *l4HTTP3Client
@@ -114,6 +123,8 @@ func NewL4Proxy(cfg L4ProxyConfig) (*L4Proxy, error) {
 		candidates:        cfg.Candidates,
 		candidateTimeout:  cfg.CandidateTimeout,
 		parallel:          cfg.Parallel,
+		packetSizeJitter:  cfg.InitialPacketSizeJitter,
+		onWinner:          cfg.OnWinner,
 	}
 	proxy.dialFn = proxy.dial
 	return proxy, nil
@@ -409,7 +420,7 @@ func (p *L4Proxy) tryCandidate(ctx context.Context, cand TunnelCandidate) (*l4HT
 		}
 	}()
 
-	udpConn, err := listenUDPForEndpoint(endpoint)
+	udpConn, err := listenUDPForEndpoint(endpoint, cand.LocalPort)
 	if err != nil {
 		return nil, err
 	}
@@ -417,10 +428,15 @@ func (p *L4Proxy) tryCandidate(ctx context.Context, cand TunnelCandidate) (*l4HT
 	// without ConnectionIDLength set, backend occasionally throws PROTOCOL_VIOLATION
 	// and that closes our connection
 	qtr := &quic.Transport{Conn: udpConn, ConnectionIDLength: 20}
-	quicConn, err := qtr.Dial(attemptCtx, endpoint, cand.TLSConfig, p.quicConfig)
+	quicConfig := p.effectiveQUICConfig(cand)
+	quicConn, err := qtr.Dial(attemptCtx, endpoint, cand.TLSConfig, quicConfig)
 	if err != nil {
 		_ = udpConn.Close()
 		return nil, err
+	}
+
+	if p.onWinner != nil {
+		p.onWinner(cand.Label)
 	}
 
 	return &l4HTTP3Client{
@@ -428,6 +444,30 @@ func (p *L4Proxy) tryCandidate(ctx context.Context, cand TunnelCandidate) (*l4HT
 		quicConn:   quicConn,
 		clientConn: (&http3.Transport{}).NewClientConn(quicConn),
 	}, nil
+}
+
+// effectiveQUICConfig returns the QUIC config for a single attempt. The initial
+// packet size is varied per attempt when a jitter is configured: a constant size
+// is itself a fingerprint, and a candidate may override the size outright.
+func (p *L4Proxy) effectiveQUICConfig(cand TunnelCandidate) *quic.Config {
+	if p.quicConfig == nil {
+		return nil
+	}
+
+	size := p.quicConfig.InitialPacketSize
+	if cand.InitialPacketSize > 0 {
+		size = cand.InitialPacketSize
+	} else if size > 0 && p.packetSizeJitter > 0 {
+		size += uint16(rand.IntN(int(p.packetSizeJitter) + 1))
+	}
+	if size == p.quicConfig.InitialPacketSize {
+		return p.quicConfig
+	}
+
+	cloned := *p.quicConfig
+	cloned.InitialPacketSize = size
+	cloned.DisablePathMTUDiscovery = true
+	return &cloned
 }
 
 func (p *L4Proxy) closeClientConnIfCurrent(expected *l4HTTP3Client) {
@@ -446,11 +486,13 @@ func (p *L4Proxy) closeClientConnIfCurrent(expected *l4HTTP3Client) {
 	closeL4HTTP3(expected.udpConn, expected.quicConn)
 }
 
-func listenUDPForEndpoint(endpoint *net.UDPAddr) (*net.UDPConn, error) {
+// listenUDPForEndpoint создаёт UDP-сокет под семейство адреса сервера.
+// localPort == 0 означает системный (эфемерный) порт источника.
+func listenUDPForEndpoint(endpoint *net.UDPAddr, localPort int) (*net.UDPConn, error) {
 	if endpoint.IP.To4() == nil {
-		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero})
+		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero, Port: localPort})
 	}
-	return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero})
+	return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: localPort})
 }
 
 func closeL4HTTP3(udpConn *net.UDPConn, quicConn *quic.Conn) {

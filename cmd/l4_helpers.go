@@ -133,14 +133,11 @@ func buildL4Proxy(cmd *cobra.Command, mode string) (l4ProxyOptions, *api.L4Proxy
 	}
 
 	proxy, err := api.NewL4Proxy(api.L4ProxyConfig{
-		TLSConfig:        plan.TLSConfig,
-		QUICConfig:       l4QUICConfig(opts.keepalivePeriod, opts.initialPacketSize),
-		Endpoint:         plan.Endpoint,
-		Candidates:       plan.Candidates,
-		CandidateTimeout: plan.CandidateTimeout,
-		Parallel:         plan.Parallel,
-		DNSResolver:      resolver,
-		ResolveLocally:   opts.localDNS,
+		TLSConfig:  plan.TLSConfig,
+		QUICConfig: l4QUICConfig(opts.keepalivePeriod, opts.initialPacketSize),
+		Endpoint:   plan.Endpoint,
+		Candidates: plan.Candidates,
+		OnWinner:   plan.OnWinner(),
 		OnConnect: func(target string) {
 			env := cloneHookEnv(hookEnv)
 			env["USQUE_EVENT"] = "connect"
@@ -153,6 +150,11 @@ func buildL4Proxy(cmd *cobra.Command, mode string) (l4ProxyOptions, *api.L4Proxy
 			env["USQUE_TARGET"] = target
 			api.RunHook(opts.onDisconnect, env)
 		},
+		CandidateTimeout:        plan.CandidateTimeout,
+		Parallel:                plan.Parallel,
+		InitialPacketSizeJitter: plan.PacketSizeJitter,
+		DNSResolver:             resolver,
+		ResolveLocally:          opts.localDNS,
 	})
 	if err != nil {
 		return opts, nil, fmt.Errorf("failed to create l4 proxy: %v", err)

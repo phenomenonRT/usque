@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Diniboy1123/usque/api"
 	"github.com/Diniboy1123/usque/internal"
+	"github.com/spf13/cobra"
 )
 
 func TestDedupeStrings(t *testing.T) {
@@ -262,6 +264,257 @@ func TestBuildCandidatesWithoutSNIs(t *testing.T) {
 	if got := buildCandidates(candidateInput{QUICIPs: []string{"192.0.2.1"}}); got != nil {
 		t.Fatalf("got %v, want nil", got)
 	}
+}
+
+func TestBuildCandidatesVariantPhases(t *testing.T) {
+	// Experiments that cost one attempt each (no SNI, the opposite TLS curve
+	// profile, a fixed source port) must be tried on the primary address before
+	// the sweep starts walking ports and addresses.
+	got := buildCandidates(candidateInput{
+		SNIs:         []string{"neutral.example"},
+		TLSBySNI:     map[string]*tls.Config{"neutral.example": {}},
+		TLSConfigAlt: &tls.Config{ServerName: "neutral.example"},
+		AltCurve:     "p256",
+		NoSNI:        &tls.Config{},
+		QUICIPs:      []string{"192.0.2.1"},
+		H2IPs:        []string{"192.0.2.11"},
+		Ports:        []int{443, 500},
+		H2Ports:      []int{443},
+		SourcePorts:  []int{4500},
+	})
+
+	want := []string{
+		"quic 192.0.2.1:443 sni=neutral.example",
+		"h2 192.0.2.11:443 sni=neutral.example",
+		"quic 192.0.2.1:443 без SNI",
+		"h2 192.0.2.11:443 без SNI",
+		"quic 192.0.2.1:443 sni=neutral.example curve=p256",
+		"h2 192.0.2.11:443 sni=neutral.example curve=p256",
+		"quic 192.0.2.1:443 sni=neutral.example sport=4500",
+		"quic 192.0.2.1:500 sni=neutral.example",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d candidates, want %d: %v", len(got), len(want), labelsOf(got))
+	}
+	for i, label := range want {
+		if got[i].Label != label {
+			t.Fatalf("candidate %d = %q, want %q", i, got[i].Label, label)
+		}
+	}
+
+	// The name-less handshake must really have no SNI, and the fixed-source-port
+	// attempt must carry its port.
+	if got[2].TLSConfig.ServerName != "" || got[3].TLSConfig.ServerName != "" {
+		t.Fatal("candidates must be built without a server name")
+	}
+	if got[6].LocalPort != 4500 {
+		t.Fatalf("source port candidate LocalPort = %d, want 4500", got[6].LocalPort)
+	}
+	for i, c := range got {
+		if i != 6 && c.LocalPort != 0 {
+			t.Fatalf("candidate %d unexpectedly sets LocalPort = %d", i, c.LocalPort)
+		}
+	}
+}
+
+func TestBuildCandidatesWithoutVariantsStaysUnchanged(t *testing.T) {
+	// Without the optional inputs the sweep must be exactly the classic one:
+	// the phases above are skippable while the server keeps working with SNI.
+	got := buildCandidates(candidateInput{
+		SNIs:     []string{"neutral.example"},
+		TLSBySNI: map[string]*tls.Config{"neutral.example": {}},
+		QUICIPs:  []string{"192.0.2.1"},
+		H2IPs:    []string{"192.0.2.11"},
+		Ports:    []int{443, 500},
+		H2Ports:  []int{443},
+	})
+	want := []string{
+		"quic 192.0.2.1:443 sni=neutral.example",
+		"h2 192.0.2.11:443 sni=neutral.example",
+		"quic 192.0.2.1:500 sni=neutral.example",
+	}
+	if !reflect.DeepEqual(labelsOf(got), want) {
+		t.Fatalf("labels = %v, want %v", labelsOf(got), want)
+	}
+}
+
+func TestBuildCandidatesQUICOnly(t *testing.T) {
+	// L4-прокси собирает список тем же кодом, но без HTTP/2: адресов TCP у него нет.
+	got := buildCandidates(candidateInput{
+		SNIs:     []string{"neutral.example", "cf.example"},
+		TLSBySNI: map[string]*tls.Config{"neutral.example": {}, "cf.example": {}},
+		QUICIPs:  []string{"192.0.2.1", "192.0.2.2"},
+		Ports:    []int{443, 500},
+	})
+	for _, c := range got {
+		if c.UseHTTP2 {
+			t.Fatalf("candidate %q is HTTP/2, want QUIC only", c.Label)
+		}
+	}
+	if len(got) == 0 {
+		t.Fatal("no candidates built")
+	}
+}
+
+func TestAppendWithinCapReservesRoomForIPv6(t *testing.T) {
+	var base []api.TunnelCandidate
+	for i := 0; i < maxBypassCandidates; i++ {
+		base = append(base, api.TunnelCandidate{Label: fmt.Sprintf("v4-%d", i)})
+	}
+	extra := make([]api.TunnelCandidate, 0, 20)
+	for i := 0; i < 20; i++ {
+		extra = append(extra, api.TunnelCandidate{Label: fmt.Sprintf("v6-%d", i)})
+	}
+
+	got := appendWithinCap(base, extra)
+	if len(got) != maxBypassCandidates {
+		t.Fatalf("got %d candidates, want %d", len(got), maxBypassCandidates)
+	}
+	if got[len(got)-1].Label != "v6-15" {
+		t.Fatalf("last candidate = %q, want the IPv6 tail to be kept", got[len(got)-1].Label)
+	}
+	v4 := 0
+	for _, c := range got {
+		if strings.HasPrefix(c.Label, "v4-") {
+			v4++
+		}
+	}
+	if want := maxBypassCandidates - maxBypassCandidates/4; v4 != want {
+		t.Fatalf("kept %d IPv4 candidates, want %d", v4, want)
+	}
+
+	if got := appendWithinCap([]api.TunnelCandidate{{Label: "only"}}, nil); len(got) != 1 {
+		t.Fatalf("appendWithinCap without a tail changed the list: %v", labelsOf(got))
+	}
+}
+
+func TestPreferRememberedCandidate(t *testing.T) {
+	list := []api.TunnelCandidate{{Label: "a"}, {Label: "b"}, {Label: "c"}}
+
+	got, ok := preferRememberedCandidate(list, "c")
+	if !ok {
+		t.Fatal("remembered combination was not found")
+	}
+	if !reflect.DeepEqual(labelsOf(got), []string{"c", "a", "b"}) {
+		t.Fatalf("order = %v, want [c a b]", labelsOf(got))
+	}
+	if !reflect.DeepEqual(labelsOf(list), []string{"a", "b", "c"}) {
+		t.Fatalf("the input list was modified: %v", labelsOf(list))
+	}
+
+	// A stale file from another network must not break the sweep.
+	got, ok = preferRememberedCandidate(list, "gone")
+	if ok || !reflect.DeepEqual(labelsOf(got), []string{"a", "b", "c"}) {
+		t.Fatalf("stale combination: ok=%v order=%v", ok, labelsOf(got))
+	}
+	if _, ok := preferRememberedCandidate(list, ""); ok {
+		t.Fatal("an empty remembered label must be reported as not found")
+	}
+
+	// Already first: nothing to reorder.
+	got, ok = preferRememberedCandidate(list, "a")
+	if !ok || !reflect.DeepEqual(labelsOf(got), []string{"a", "b", "c"}) {
+		t.Fatalf("first combination: ok=%v order=%v", ok, labelsOf(got))
+	}
+}
+
+func TestBypassStateRoundTrip(t *testing.T) {
+	path := t.TempDir() + "/config.json.bypass"
+	if got := readBypassState(path); got != "" {
+		t.Fatalf("readBypassState on a missing file = %q, want an empty string", got)
+	}
+	if err := writeBypassState(path, "quic 192.0.2.1:500 sni=www.microsoft.com"); err != nil {
+		t.Fatalf("writeBypassState: %v", err)
+	}
+	if got := readBypassState(path); got != "quic 192.0.2.1:500 sni=www.microsoft.com" {
+		t.Fatalf("readBypassState = %q", got)
+	}
+	if err := writeBypassState("", "x"); err != nil {
+		t.Fatalf("writeBypassState with no path must be a no-op: %v", err)
+	}
+	if err := writeBypassState(path, ""); err != nil {
+		t.Fatalf("writeBypassState with no label must be a no-op: %v", err)
+	}
+}
+
+func TestBypassStatePath(t *testing.T) {
+	newCmd := func() *cobra.Command {
+		c := &cobra.Command{Use: "test"}
+		c.Flags().StringP("config", "c", "config.json", "")
+		c.Flags().String("bypass-state", "", "")
+		return c
+	}
+
+	c := newCmd()
+	if got := bypassStatePath(c); got != "config.json"+bypassStateExt {
+		t.Fatalf("default path = %q, want the config path plus %q", got, bypassStateExt)
+	}
+
+	// A custom path replaces the default one.
+	if err := c.Flags().Set("bypass-state", "/etc/usque/warp.bypass"); err != nil {
+		t.Fatal(err)
+	}
+	if got := bypassStatePath(c); got != "/etc/usque/warp.bypass" {
+		t.Fatalf("custom path = %q", got)
+	}
+
+	// "-" (and its synonyms) turns remembering off completely.
+	for _, off := range []string{"-", "off", "none", " OFF "} {
+		c := newCmd()
+		if err := c.Flags().Set("bypass-state", off); err != nil {
+			t.Fatal(err)
+		}
+		if got := bypassStatePath(c); got != "" {
+			t.Fatalf("bypass-state %q = %q, want an empty path", off, got)
+		}
+	}
+}
+
+func TestOnWinnerRemembersOnlyNewCombinations(t *testing.T) {
+	path := t.TempDir() + "/config.json.bypass"
+	plan := tunnelPlan{StatePath: path}
+
+	onWinner := plan.OnWinner()
+	if onWinner == nil {
+		t.Fatal("OnWinner returned nil for a configured path")
+	}
+	onWinner("quic 192.0.2.1:443 sni=a.example")
+	if got := readBypassState(path); got != "quic 192.0.2.1:443 sni=a.example" {
+		t.Fatalf("remembered %q", got)
+	}
+
+	// The same combination must not rewrite the file (flash wears out), but a
+	// new one must.
+	onWinner("quic 192.0.2.1:443 sni=a.example")
+	onWinner("h2 192.0.2.11:443 sni=b.example")
+	if got := readBypassState(path); got != "h2 192.0.2.11:443 sni=b.example" {
+		t.Fatalf("remembered %q", got)
+	}
+
+	onWinner("")
+	if got := readBypassState(path); got != "h2 192.0.2.11:443 sni=b.example" {
+		t.Fatalf("an empty label must be ignored, got %q", got)
+	}
+
+	if off := (tunnelPlan{}).OnWinner(); off != nil {
+		t.Fatal("OnWinner must be nil when remembering is off")
+	}
+}
+
+func TestDedupePorts(t *testing.T) {
+	got := dedupePorts([]int{4500, 0, 443, 4500, 70000, -1, 500})
+	want := []int{4500, 443, 500}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("dedupePorts = %v, want %v", got, want)
+	}
+}
+
+func labelsOf(cands []api.TunnelCandidate) []string {
+	out := make([]string, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.Label)
+	}
+	return out
 }
 
 func TestIsCloudflareName(t *testing.T) {

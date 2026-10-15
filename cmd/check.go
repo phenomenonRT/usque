@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"time"
@@ -131,7 +132,7 @@ var checkCmd = &cobra.Command{
 			go func() {
 				results <- checkResult{
 					idx:    idx,
-					reason: checkCandidate(runCtx, cand, keepalivePeriod, plan.InitialPacketSize, plan.Fragment, timeout),
+					reason: checkCandidate(runCtx, cand, keepalivePeriod, plan.InitialPacketSize, plan.PacketSizeJitter, plan.Fragment, timeout),
 				}
 			}()
 		}
@@ -286,23 +287,42 @@ func checkVerdict(outcomes []checkOutcome) []string {
 		lines = append(lines,
 			fmt.Sprintf("работает имя %s, а %s нет: похоже, провайдер режет имена по SNI.", winner.sni, first.sni))
 	}
+	if winner.sni == "" && first.sni != "" {
+		lines = append(lines,
+			"сработало рукопожатие вообще без SNI: имя сервера провайдеру не видно — похоже, режут именно имена.")
+	}
 	return lines
 }
 
 // checkCandidate выполняет одну попытку подключения к MASQUE и возвращает
 // пустую строку при успехе либо причину отказа.
-func checkCandidate(ctx context.Context, cand api.TunnelCandidate, keepalivePeriod time.Duration, initialPacketSize uint16, fragment *api.TLSFragmentConfig, timeout time.Duration) string {
+func checkCandidate(ctx context.Context, cand api.TunnelCandidate, keepalivePeriod time.Duration, initialPacketSize, packetSizeJitter uint16, fragment *api.TLSFragmentConfig, timeout time.Duration) string {
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	// Размер первого пакета меняется от попытки к попытке: константа сама по
+	// себе является признаком для DPI.
+	size := initialPacketSize
+	if cand.InitialPacketSize > 0 {
+		size = cand.InitialPacketSize
+	} else if size > 0 && packetSizeJitter > 0 {
+		size += uint16(rand.IntN(int(packetSizeJitter) + 1))
+	}
+
+	var opts []api.ConnectOption
+	if cand.LocalPort > 0 && !cand.UseHTTP2 {
+		opts = append(opts, api.WithLocalUDPPort(cand.LocalPort))
+	}
 
 	udpConn, tr, ipConn, rsp, err := api.ConnectTunnel(
 		attemptCtx,
 		cand.TLSConfig,
-		internal.DefaultQuicConfig(keepalivePeriod, initialPacketSize),
+		internal.DefaultQuicConfig(keepalivePeriod, size),
 		internal.ConnectURI,
 		cand.Endpoint,
 		cand.UseHTTP2,
 		fragment,
+		opts...,
 	)
 
 	var reason string

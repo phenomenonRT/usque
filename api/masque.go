@@ -107,11 +107,41 @@ func PrepareTlsConfig(privKey *ecdsa.PrivateKey, peerPubKey *ecdsa.PublicKey, ce
 //   - *connectip.Conn: The Connect-IP connection instance.
 //   - *http.Response: The response from the Connect-IP handshake.
 //   - error: An error if the connection setup fails.
-func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, connectUri string, endpoint net.Addr, useHTTP2 bool, fragment *TLSFragmentConfig) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+//
+// ConnectOption настраивает отдельную попытку подключения к MASQUE.
+type ConnectOption func(*connectOptions)
+
+// connectOptions — необязательные параметры одной попытки.
+type connectOptions struct {
+	localPort int
+}
+
+// WithLocalUDPPort задаёт порт источника для QUIC-сокета (0 — системный).
+// Нужен там, где DPI фильтрует по порту источника. Порт может быть занят или
+// (на Linux) требовать прав root: тогда попытка просто провалится.
+func WithLocalUDPPort(port int) ConnectOption {
+	return func(o *connectOptions) {
+		o.localPort = port
+	}
+}
+
+// applyConnectOptions собирает параметры попытки из переданных опций.
+func applyConnectOptions(opts []ConnectOption) connectOptions {
+	var o connectOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
+}
+
+func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, connectUri string, endpoint net.Addr, useHTTP2 bool, fragment *TLSFragmentConfig, opts ...ConnectOption) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
 	template := uritemplate.MustNew(connectUri)
 	additionalHeaders := http.Header{
 		"User-Agent": []string{""},
 	}
+	options := applyConnectOptions(opts)
 
 	if useHTTP2 {
 		h2Endpoint, ok := endpoint.(*net.TCPAddr)
@@ -146,7 +176,7 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		udpConn, tr, ipConn, rsp, err := connectTunnelHTTP3(ctx, tlsConfig, quicConfig, template, additionalHeaders, quicEndpoint)
+		udpConn, tr, ipConn, rsp, err := connectTunnelHTTP3(ctx, tlsConfig, quicConfig, template, additionalHeaders, quicEndpoint, options.localPort)
 		if err == nil {
 			return udpConn, tr, ipConn, rsp, nil
 		}
@@ -161,18 +191,18 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
 	return nil, nil, nil, nil, fmt.Errorf("failed to dial connect-ip: %w", lastErr)
 }
 
-func connectTunnelHTTP3(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, template *uritemplate.Template, additionalHeaders http.Header, endpoint *net.UDPAddr) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+func connectTunnelHTTP3(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.Config, template *uritemplate.Template, additionalHeaders http.Header, endpoint *net.UDPAddr, localPort int) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
 	var udpConn *net.UDPConn
 	var err error
 	if endpoint.IP.To4() == nil {
 		udpConn, err = net.ListenUDP("udp", &net.UDPAddr{
 			IP:   net.IPv6zero,
-			Port: 0,
+			Port: localPort,
 		})
 	} else {
 		udpConn, err = net.ListenUDP("udp", &net.UDPAddr{
 			IP:   net.IPv4zero,
-			Port: 0,
+			Port: localPort,
 		})
 	}
 	if err != nil {

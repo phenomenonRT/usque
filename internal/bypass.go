@@ -1,5 +1,11 @@
 package internal
 
+import (
+	"crypto/tls"
+	"fmt"
+	"strings"
+)
+
 // Параметры обхода ТСПУ (DPI) для клиента usque.
 //
 // Всё, что здесь описано, работает только на стороне клиента: протокол MASQUE
@@ -117,3 +123,49 @@ const BypassH2Port = 443
 // минимум по RFC 9000 и одновременно отключение PMTU-зондирования крупными
 // пакетами, которые ТСПУ часто дропает молча.
 const BypassInitialPacketSize = 1200
+
+// BypassPacketSizeJitter — на сколько байт можно случайно увеличить первый
+// пакет относительно BypassInitialPacketSize. Постоянный размер сам по себе
+// является признаком: набор «ровно 1200 байт в каждую сторону» легко отфильтровать.
+const BypassPacketSizeJitter = 80
+
+// BypassFragmentJitter — максимальное случайное смещение (± в байтах) точек
+// разрыва TLS ClientHello. Без него точки разрыва постоянны и сами становятся
+// признаком.
+const BypassFragmentJitter = 2
+
+// TLSCurvesForName переводит имя профиля кривых TLS в список для tls.Config.
+//
+// Профиль влияет и на обход блокировок, а не только на криптографию:
+//   - "auto" — дефолты Go: в Go 1.24+ ClientHello несёт пост-квантовую долю
+//     X25519MLKEM768 и вырастает примерно до 1.7 КБ;
+//   - "p256" — только P-256: ClientHello ужимается примерно до 300 байт (его
+//     проще разрезать на сегменты и он меньше похож на экзотику), а если сервер
+//     отвечает HelloRetryRequest и просит P-256, лишний круг пропускается;
+//   - "x25519" — только X25519, без пост-квантовой доли.
+func TLSCurvesForName(name string) ([]tls.CurveID, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "auto", "default":
+		return nil, nil
+	case "p256", "p-256", "secp256r1":
+		return []tls.CurveID{tls.CurveP256}, nil
+	case "x25519":
+		return []tls.CurveID{tls.X25519}, nil
+	default:
+		return nil, fmt.Errorf("unknown TLS curve %q: use auto, p256 or x25519", name)
+	}
+}
+
+// AlternateCurveName возвращает противоположный профиль кривых: если основной
+// ClientHello ужат до P-256, альтернатива — дефолты Go, и наоборот. Так перебор
+// не зависит от того, какую кривую поддерживает сервер: проверяются оба варианта.
+func AlternateCurveName(name string) string {
+	curves, err := TLSCurvesForName(name)
+	if err != nil {
+		return ""
+	}
+	if len(curves) == 1 && curves[0] == tls.CurveP256 {
+		return "auto"
+	}
+	return "p256"
+}

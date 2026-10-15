@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/tls"
+	"math/rand/v2"
 	"net"
 	"time"
 )
@@ -13,15 +14,18 @@ import (
 // ClientHello в середине имени сервера, проверяющее устройство не видит цельный
 // шаблон, а удалённый сервер без проблем собирает поток TCP.
 //
-// Нулевая конфигурация выключена. Auto включает разбиение по середине SNI,
+// Нулевая конфигурация выключена. Auto включает разбиение по имени сервера,
 // Sizes задаёт сегменты явно и имеет приоритет.
 type TLSFragmentConfig struct {
-	// Auto — обрывать ClientHello в середине имени сервера (SNI).
+	// Auto — рвать ClientHello внутри имени сервера (SNI).
 	Auto bool
 	// Sizes — явные размеры первых сегментов в байтах.
 	Sizes []int
 	// Delay — пауза между сегментами.
 	Delay time.Duration
+	// Jitter — максимальное случайное смещение (в байтах, ±) точек разрыва.
+	// Без него точка разрыва постоянна, а значит сама является признаком.
+	Jitter int
 }
 
 // DefaultTLSFragmentConfig возвращает конфигурацию с автоматическим разбиением
@@ -42,6 +46,13 @@ type TunnelCandidate struct {
 	Endpoint  net.Addr
 	UseHTTP2  bool
 	Label     string
+	// InitialPacketSize, когда не ноль, задаёт размер первого QUIC-пакета для
+	// этой попытки. Перебор разных значений не даёт DPI зацепиться за константу.
+	InitialPacketSize uint16
+	// LocalPort, когда не ноль, задаёт порт источника для QUIC-сокета
+	// (некоторые DPI фильтруют по нему). Требует прав на привилегированные
+	// порты; при неудаче попытка просто провалится.
+	LocalPort int
 }
 
 // wrapTLSFragment оборачивает соединение так, чтобы первый Write (TLS ClientHello)
@@ -146,25 +157,43 @@ func (c *fragmentConn) flush() error {
 	return nil
 }
 
-// planFor выбирает точки разрыва для первой записи ClientHello.
+// planFor выбирает, на какие сегменты разрезать первую запись ClientHello.
+// Возвращаются размеры сегментов (как у явных Sizes), а не смещения.
 //
-// Явные Sizes имеют приоритет. Иначе берётся середина имени сервера (SNI):
-// именно его ищет DPI, и разрыв внутри имени не даёт собрать шаблон. Если
-// ClientHello разобрать не удалось, используется классический разрыв после
-// первого байта.
+// Явные Sizes имеют приоритет. Иначе берутся две точки внутри имени сервера
+// (SNI): именно его ищет DPI, и разрыв внутри имени не даёт собрать шаблон — ни
+// цельного имени, ни цельного ClientHello. Если ClientHello разобрать не
+// удалось, используется классический разрыв после первого байта.
 func (c *TLSFragmentConfig) planFor(buf []byte) []int {
 	if len(c.Sizes) > 0 {
 		return c.Sizes
 	}
 	start, end, ok := clientHelloSNI(buf)
-	if !ok || end <= start {
+	if !ok || end-start < 3 {
 		return []int{1}
 	}
-	mid := start + (end-start)/2
-	if mid <= 0 || mid >= len(buf) {
+
+	n := end - start
+	offsets := []int{start + n/3, start + 2*n/3}
+	if c.Jitter > 0 {
+		for i := range offsets {
+			offsets[i] += rand.IntN(2*c.Jitter+1) - c.Jitter
+		}
+	}
+
+	sizes := make([]int, 0, len(offsets))
+	prev := 0
+	for _, off := range offsets {
+		if off <= start || off >= end || off <= prev {
+			continue
+		}
+		sizes = append(sizes, off-prev)
+		prev = off
+	}
+	if len(sizes) == 0 {
 		return []int{1}
 	}
-	return []int{mid}
+	return sizes
 }
 
 // tlsRecordTotal разбирает заголовок первой TLS-записи.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
@@ -198,6 +199,14 @@ type MaintainTunnelConfig struct {
 	// below two mean sequential attempts. Parallelism only helps when most
 	// attempts time out, which is exactly the case on a DPI-filtered network.
 	Parallel int
+	// OnWinner, when set, is called with the label of a candidate that just
+	// connected, so callers can remember the working combination across restarts.
+	OnWinner func(label string)
+	// InitialPacketSizeJitter, when positive, adds up to that many random bytes
+	// to the QUIC initial packet size of every attempt. A constant size (the
+	// RFC minimum 1200) is itself a fingerprint, so the sweep keeps varying it.
+	// Values stay within roughly 1200..1300 bytes, safe on any path.
+	InitialPacketSizeJitter uint16
 	// OnConnect is a path to an executable run after every successful tunnel
 	// connect. It is exec'd directly (no shell, no args) and runs fire-and-forget.
 	OnConnect string
@@ -407,15 +416,27 @@ func tryCandidate(ctx context.Context, cfg MaintainTunnelConfig, cand TunnelCand
 		attemptCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
 	}
 
+	initialPacketSize := cfg.InitialPacketSize
+	if cand.InitialPacketSize > 0 {
+		initialPacketSize = cand.InitialPacketSize
+	} else if initialPacketSize > 0 && cfg.InitialPacketSizeJitter > 0 {
+		initialPacketSize += uint16(rand.IntN(int(cfg.InitialPacketSizeJitter) + 1))
+	}
+	var opts []ConnectOption
+	if cand.LocalPort > 0 && !cand.UseHTTP2 {
+		opts = append(opts, WithLocalUDPPort(cand.LocalPort))
+	}
+
 	log.Printf("Establishing MASQUE connection to %s (%s)", cand.Endpoint, cand.Label)
 	udpConn, tr, ipConn, rsp, err := ConnectTunnel(
 		attemptCtx,
 		cand.TLSConfig,
-		internal.DefaultQuicConfig(cfg.KeepalivePeriod, cfg.InitialPacketSize),
+		internal.DefaultQuicConfig(cfg.KeepalivePeriod, initialPacketSize),
 		internal.ConnectURI,
 		cand.Endpoint,
 		cand.UseHTTP2,
 		cfg.Fragment,
+		opts...,
 	)
 	if cancel != nil {
 		cancel()
@@ -519,6 +540,9 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			continue
 		}
 		startIdx = winner
+		if cfg.OnWinner != nil {
+			cfg.OnWinner(session.candidate.Label)
+		}
 
 		udpConn := session.udpConn
 		tr := session.transport

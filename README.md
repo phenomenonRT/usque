@@ -575,22 +575,31 @@ TSPU (the Russian DPI system) and similar middleboxes do not only match on the S
 usque --config config.json nativetun --bypass -n usque0
 ```
 
-When `--bypass` is set, the client walks the combinations **breadth-first** — the first couple of dozen attempts cover every dimension (transport, port, SNI, address) instead of exhausting one — until one connects. Names outside Cloudflare are tried first, because the server accepts any name and TSPU blocks Cloudflare domains by SNI. The winner is remembered and preferred on reconnect:
+When `--bypass` is set, the client walks the combinations **breadth-first** — the first couple of dozen attempts cover every dimension (transport, handshake shape, port, SNI, address) instead of exhausting one — until one connects. Names outside Cloudflare are tried first, because the server accepts any name and TSPU blocks Cloudflare domains by SNI. The winner is remembered and preferred on reconnect:
 
 1. **Transport** — QUIC first, then HTTP/2 over TCP+TLS (which can be fragmented, see below).
-2. **Port sweep** — the configured server address with the standard port first (443) and the documented fallbacks (`500`, `1701`, `4500`, `4443`, `8443`, `8095`) after it.
-3. **SNI sweep** — `www.microsoft.com`, `www.apple.com`, `www.bing.com`, then the Cloudflare names (`one.one.one.one`, `www.cloudflare.com`, `zt-masque.cloudflareclient.com`, `consumer-masque.cloudflareclient.com`). Passing `-s` disables the sweep and pins your own name.
-4. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses (`162.159.197.0/24`, `162.159.192.0/24`, `162.159.193.0/24`, `162.159.195.0/24`, `162.159.204.0/24`).
-5. **Address × SNI pairs** for the remaining combinations.
+2. **Handshake without SNI** — the ClientHello carries no server name at all, so there is nothing for the DPI to match against. One attempt per transport; if the server accepts it, it is the most robust combination there is.
+3. **The opposite TLS curve profile** — the same name, but a different ClientHello shape and size (see `--tls-curve`). The sweep therefore does not depend on whether the server accepts the key share Go prefers.
+4. **Custom source ports** — only with `--bypass-source-port`.
+5. **Port sweep** — the configured server address with the standard port first (443) and the documented fallbacks (`500`, `1701`, `4500`, `4443`, `8443`, `8095`) after it.
+6. **SNI sweep** — `www.microsoft.com`, `www.apple.com`, `www.bing.com`, then the Cloudflare names (`one.one.one.one`, `www.cloudflare.com`, `zt-masque.cloudflareclient.com`, `consumer-masque.cloudflareclient.com`). Passing `-s` disables the sweep and pins your own name.
+7. **Endpoint sweep** — additional Cloudflare WARP/MASQUE addresses (`162.159.197.0/24`, `162.159.192.0/24`, `162.159.193.0/24`, `162.159.195.0/24`, `162.159.204.0/24`).
+8. **Address × SNI pairs** for the remaining combinations.
+9. **IPv6 tail** — when IPv6 works on your network and `-6` was not given, up to a quarter of the list is filled with IPv6 combinations: providers often filter IPv4 much harder.
 
 Additional knobs:
 
 - `--bypass-endpoint <ip>` (repeatable) — add your own server addresses to the end of the sweep.
 - `--bypass-sni <name>` (repeatable) — replace the built-in SNI list with your own names. Use this when your provider blocks Cloudflare domains by SNI: the server ignores the name (the client pins the endpoint's public key, not the certificate name), so any non-blocked domain works. Example: `--bypass --bypass-sni www.example.com`.
-- `--tls-fragment` — for HTTP/2 candidates, split the TLS ClientHello into separate TCP segments so a middlebox cannot see the handshake in one packet. By default the split lands **in the middle of the host name**, so the SNI itself is broken across segments; `--tls-fragment-sizes` sets explicit segment sizes, `--tls-fragment-delay` adds a pause between segments.
+- `--tls-curve auto|p256|x25519` — which curves the main ClientHello offers (default `auto`). `p256` shrinks the ClientHello from roughly 1.7 KB to 300 bytes (no post-quantum key share), which makes the fragmentation below far more effective and skips the extra round trip when the server asks for P-256. The opposite profile is always tried as its own combinations, so nothing is lost by picking one.
+- `--bypass-no-sni` (default on) — try the name-less handshake described above. Disable it if you want strictly "normal" handshakes only.
+- `--bypass-source-port <port>` (repeatable, off by default) — try the primary address from that fixed UDP source port. Some DPI filters on the source port; ports below 1024 need root.
+- `--bypass-ipv6-fallback` (default on) — append IPv6 combinations when IPv6 is reachable (`-6` still forces IPv6 for the whole sweep).
+- `--tls-fragment` — for HTTP/2 candidates, split the TLS ClientHello into separate TCP segments so a middlebox cannot see the handshake in one packet. By default the ClientHello is cut at **two points inside the host name**, so neither the name nor the handshake is ever whole; `--tls-fragment-jitter` randomizes those points (a constant split point is a fingerprint of its own), `--tls-fragment-sizes` sets explicit segment sizes, `--tls-fragment-delay` adds a pause between segments.
 - `--bypass-parallel <n>` — keep that many attempts in flight at once (default `3`). Since blocked combinations cost a full timeout each, this cuts the time to find a working one by roughly the same factor.
 - `--connect-timeout` — bound a single candidate attempt (default `5s`), so silently dropped addresses are skipped quickly.
-- In bypass mode the initial QUIC packet is capped at 1200 bytes, which disables PMTU probing with large packets that are often dropped silently.
+- `--bypass-state <file>` — where the winning combination is remembered (default: next to `config.json`). The file is read at startup and written only when the winner changes, so a router restart reconnects without a sweep. `--bypass-state -` disables remembering entirely.
+- In bypass mode the initial QUIC packet is capped at 1200 bytes and its exact size is randomized per attempt: PMTU probing with large packets is disabled, and the first packet is not a constant that can be fingerprinted.
 
 To find out which combination actually works on your network without bringing up a tunnel, use `check` (same sweep, no TUN, nothing changed on the system):
 

@@ -169,12 +169,25 @@ func TestFragmentConnSplitsInsideSNI(t *testing.T) {
 	if err != nil || n != len(hello) {
 		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(hello))
 	}
-	if len(rec.segments) != 2 {
-		t.Fatalf("got %d segments, want 2", len(rec.segments))
+	if len(rec.segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(rec.segments))
 	}
-	boundary := len(rec.segments[0])
-	if boundary <= start || boundary >= end {
-		t.Fatalf("split at %d does not fall inside the SNI [%d, %d)", boundary, start, end)
+	// Имя сервера не должно встречаться ни в одном сегменте целиком.
+	for i, seg := range rec.segments {
+		if bytes.Contains(seg, []byte("www.microsoft.com")) {
+			t.Fatalf("segment %d contains the whole SNI", i)
+		}
+	}
+	// Каждая внутренняя граница попадает внутрь имени сервера.
+	offset := 0
+	for i := 0; i < len(rec.segments)-1; i++ {
+		offset += len(rec.segments[i])
+		if offset <= start || offset >= end {
+			t.Fatalf("split at %d does not fall inside the SNI [%d, %d)", offset, start, end)
+		}
+	}
+	if offset != len(rec.segments[0])+len(rec.segments[1]) {
+		t.Fatalf("boundaries were counted wrong: %d", offset)
 	}
 
 	var joined []byte
@@ -201,8 +214,8 @@ func TestFragmentConnWaitsForWholeRecord(t *testing.T) {
 	if _, err := conn.Write(hello[cut:]); err != nil {
 		t.Fatalf("second write: %v", err)
 	}
-	if len(rec.segments) != 2 {
-		t.Fatalf("got %d segments, want 2", len(rec.segments))
+	if len(rec.segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(rec.segments))
 	}
 }
 
