@@ -185,7 +185,7 @@ var nativeTunCmd = &cobra.Command{
 			mtu:      mtu,
 			iproute2: !setIproute2,
 			ipv4:     !tunnelIPv4,
-			ipv6:     !tunnelIPv6 && !(mtuLimited && mtu < 1280),
+			ipv6:     !tunnelIPv6 && (!mtuLimited || mtu >= 1280),
 			persist:  persist,
 		}
 		if mtuLimited && mtu < 1280 && !tunnelIPv6 {
