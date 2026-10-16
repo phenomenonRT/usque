@@ -117,6 +117,19 @@ var nativeTunCmd = &cobra.Command{
 			log.Println("Warning: MTU is not the default 1280. This is not supported. Packet loss and other issues may occur.")
 		}
 
+		// В режиме обхода размер пакета QUIC зафиксирован (PMTU-зондирование
+		// отключено), и IP-пакет в MTU 1280 в датаграмму не помещается: маленькие
+		// пакеты проходят, большие молча теряются. Если MTU не задан явно, берём
+		// наибольший, который помещается. IPv6 при этом невозможен (нужно 1280).
+		mtuLimited := false
+		if len(plan.Candidates) > 0 && !cmd.Flags().Changed("mtu") {
+			if limit := internal.TunnelMTUForPacketSize(plan.InitialPacketSize); limit > 0 && limit < mtu {
+				log.Printf("Обход ТСПУ: пакеты QUIC фиксированы (%d байт), MTU туннеля снижен с %d до %d. Чтобы вернуть 1280 и IPv6, укажите --initial-packet-size 1350 и -m 1280.", plan.InitialPacketSize, mtu, limit)
+				mtu = limit
+				mtuLimited = true
+			}
+		}
+
 		setIproute2, err := cmd.Flags().GetBool("no-iproute2")
 		if err != nil {
 			cmd.Printf("Failed to get no set address: %v\n", err)
@@ -172,8 +185,11 @@ var nativeTunCmd = &cobra.Command{
 			mtu:      mtu,
 			iproute2: !setIproute2,
 			ipv4:     !tunnelIPv4,
-			ipv6:     !tunnelIPv6,
+			ipv6:     !tunnelIPv6 && (!mtuLimited || mtu >= 1280),
 			persist:  persist,
+		}
+		if mtuLimited && mtu < 1280 && !tunnelIPv6 {
+			log.Println("IPv6 внутри туннеля отключён: он требует MTU не меньше 1280.")
 		}
 
 		dev, err := t.create()

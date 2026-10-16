@@ -148,6 +148,31 @@ const BypassInitialPacketSize = 1200
 // является признаком: набор «ровно 1200 байт в каждую сторону» легко отфильтровать.
 const BypassPacketSizeJitter = 80
 
+// QUICDatagramOverhead — запас в байтах между размером UDP-пакета QUIC и самым
+// большим IP-пакетом, который помещается в него как HTTP-датаграмма CONNECT-IP.
+// Складывается из короткого заголовка QUIC (флаги, ID соединения до 20 байт,
+// номер пакета), тега AEAD (16), заголовка кадра DATAGRAM, идентификатора потока
+// и нулевого Context ID. Берём худший случай с небольшим запасом.
+const QUICDatagramOverhead = 50
+
+// TunnelMTUForPacketSize возвращает наибольший MTU туннеля, при котором IP-пакет
+// целиком помещается в QUIC-датаграмму, если размер UDP-пакета зафиксирован и
+// равен packetSize (PMTU-зондирование отключено). При packetSize == 0
+// зондирование включено, предела нет, и функция возвращает 0.
+//
+// Без этого полноразмерные пакеты (MTU 1280 при пакетах QUIC в 1200–1280 байт)
+// молча теряются: маленькие пакеты проходят, а TCP-сегменты и TLS — нет.
+func TunnelMTUForPacketSize(packetSize uint16) int {
+	if packetSize == 0 {
+		return 0
+	}
+	mtu := int(packetSize) - QUICDatagramOverhead
+	if mtu < 0 {
+		return 0
+	}
+	return mtu
+}
+
 // BypassFragmentJitter — максимальное случайное смещение (± в байтах) точек
 // разрыва TLS ClientHello. Без него точки разрыва постоянны и сами становятся
 // признаком.
