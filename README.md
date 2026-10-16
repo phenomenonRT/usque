@@ -600,6 +600,7 @@ Additional knobs:
 - `--connect-timeout` — bound a single candidate attempt (default `5s`), so silently dropped addresses are skipped quickly.
 - `--bypass-state <file>` — where the winning combination is remembered (default: next to `config.json`). The file is read at startup and written only when the winner changes, so a router restart reconnects without a sweep. `--bypass-state -` disables remembering entirely.
 - In bypass mode the initial QUIC packet is capped at 1200 bytes and its exact size is randomized per attempt: PMTU probing with large packets is disabled, and the first packet is not a constant that can be fingerprinted.
+- **MTU in bypass mode.** Because PMTU probing is off, QUIC packets stay at 1200–1280 bytes, which cannot carry a 1280-byte IP packet as a datagram (small packets pass, full-size TCP/TLS ones are silently lost). Unless `-m` is given, the client lowers the tunnel MTU to the packet size minus 50 bytes (1150 for the default 1200) and drops IPv6 inside the tunnel, since IPv6 needs 1280. The `--on-connect` hook receives the effective value in `USQUE_MTU` (and `USQUE_NO_IPV6=1` when IPv6 is dropped). To keep MTU 1280 and IPv6, raise the packet size: `--initial-packet-size 1350 -m 1280`.
 
 To find out which combination actually works on your network without bringing up a tunnel, use `check` (same sweep, no TUN, nothing changed on the system):
 

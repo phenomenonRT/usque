@@ -83,3 +83,27 @@ func TestBypassPoolSizesAreSane(t *testing.T) {
 			BypassInitialPacketSize+BypassPacketSizeJitter)
 	}
 }
+
+func TestTunnelMTUForPacketSize(t *testing.T) {
+	// 0 — PMTU-зондирование включено, предела нет.
+	if got := TunnelMTUForPacketSize(0); got != 0 {
+		t.Fatalf("TunnelMTUForPacketSize(0) = %d, want 0", got)
+	}
+	// Базовый размер обхода (1200) не вмещает IP-пакет в 1280 байт: это и была
+	// причина «туннель поднят, а трафика нет».
+	got := TunnelMTUForPacketSize(BypassInitialPacketSize)
+	if got <= 0 || got >= 1280 {
+		t.Fatalf("TunnelMTUForPacketSize(%d) = %d, want a positive value below 1280", BypassInitialPacketSize, got)
+	}
+	if want := BypassInitialPacketSize - QUICDatagramOverhead; got != want {
+		t.Fatalf("TunnelMTUForPacketSize(%d) = %d, want %d", BypassInitialPacketSize, got, want)
+	}
+	// Рекомендованные 1350 байт уже вмещают MTU 1280.
+	if got := TunnelMTUForPacketSize(1350); got < 1280 {
+		t.Fatalf("TunnelMTUForPacketSize(1350) = %d, want at least 1280", got)
+	}
+	// Слишком маленький пакет не должен давать отрицательный MTU.
+	if got := TunnelMTUForPacketSize(10); got != 0 {
+		t.Fatalf("TunnelMTUForPacketSize(10) = %d, want 0", got)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -292,6 +293,21 @@ type tunnelSession struct {
 	transport *http3.Transport
 	ipConn    *connectip.Conn
 	response  *http.Response
+	// initialPacketSize — размер QUIC-пакета этой попытки; 0 означает, что
+	// PMTU-зондирование включено и размер подбирается сам.
+	initialPacketSize uint16
+}
+
+// sessionMTULimit возвращает наибольший MTU туннеля, который поддерживает
+// соединение, либо 0, если ограничения нет. Предел есть только у QUIC с
+// отключённым PMTU-зондированием: пакет QUIC фиксирован (1200–1280 байт в режиме
+// обхода), и IP-пакет в 1280 байт в датаграмму не помещается. У HTTP/2 поверх
+// TCP предела нет.
+func sessionMTULimit(s *tunnelSession) int {
+	if s == nil || s.candidate.UseHTTP2 {
+		return 0
+	}
+	return internal.TunnelMTUForPacketSize(s.initialPacketSize)
 }
 
 // tunnelCandidates returns the effective candidate list. When no bypass
@@ -519,11 +535,12 @@ func tryCandidate(lifetimeCtx context.Context, dialCtx context.Context, cfg Main
 	}
 
 	return &tunnelSession{
-		candidate: cand,
-		udpConn:   udpConn,
-		transport: tr,
-		ipConn:    ipConn,
-		response:  rsp,
+		candidate:         cand,
+		udpConn:           udpConn,
+		transport:         tr,
+		ipConn:            ipConn,
+		response:          rsp,
+		initialPacketSize: initialPacketSize,
 	}, nil
 }
 
@@ -610,10 +627,26 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 
 		log.Printf("Connected to MASQUE server via %s", session.candidate.Label)
 
+		// Если пакет QUIC зафиксирован, IP-пакеты размером с MTU туннеля в
+		// датаграмму не поместятся и будут теряться. Хук получает MTU, с которым
+		// туннель реально работает; IPv6 без MTU 1280 невозможен, поэтому в этом
+		// случае хуку сообщается об отключении IPv6.
+		effectiveMTU := cfg.MTU
+		if limit := sessionMTULimit(session); limit > 0 && limit < effectiveMTU {
+			effectiveMTU = limit
+			log.Printf("Warning: tunnel MTU %d does not fit into QUIC packets of %d bytes (PMTU discovery is off); set the interface MTU to %d or lower, or raise --initial-packet-size", cfg.MTU, session.initialPacketSize, limit)
+		}
+
 		if cfg.OnConnect != "" {
 			env := cloneHookEnv(cfg.HookEnv)
 			env["USQUE_EVENT"] = "connect"
 			env["USQUE_ENDPOINT"] = session.candidate.Endpoint.String()
+			if effectiveMTU != cfg.MTU {
+				env["USQUE_MTU"] = strconv.Itoa(effectiveMTU)
+				if effectiveMTU < 1280 {
+					env["USQUE_NO_IPV6"] = "1"
+				}
+			}
 			RunHook(cfg.OnConnect, env)
 		}
 
