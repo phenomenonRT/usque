@@ -19,21 +19,29 @@ valid_cfg() {
 	return 0
 }
 
-# строка -> JSON-строка (без кавычек вокруг)
+# строка -> JSON-строка (без кавычек вокруг).
+# Значения из безопасных символов уходят в JSON как есть, без запуска tr/sed:
+# панель опрашивает состояние каждые несколько секунд, и на слабом роутере
+# десятки лишних процессов на вызов заметны. Всё остальное — через экранирование.
 jesc() {
-	printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'
+	case "$1" in
+	*[!A-Za-z0-9\ ._:=/@,+-]*)
+		printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' ;;
+	*)
+		printf '%s' "$1" ;;
+	esac
 }
 
 # многострочный текст со stdin -> одна JSON-строка с \n
 jlines() {
-	tr -d '\000-\011\013-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' |
+	sed 's/[[:cntrl:]]//g; s/\\/\\\\/g; s/"/\\"/g' |
 		awk 'BEGIN { ORS = "" } { if (NR > 1) print "\\n"; print $0 }'
 }
 
 jbool() { [ "$1" = 1 ] && printf true || printf false; }
 
-kv() { # файл ключ
-	sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1
+kv() { # файл ключ -> значение
+	sed -n "s/^$2=//p" "$1" 2>/dev/null
 }
 
 cfgval() { # файл ключ
@@ -50,7 +58,8 @@ arg() { # ключ
 
 alive() { # iface
 	local pid
-	pid="$(cat "$STATE/$1.pid" 2>/dev/null)"
+	[ -r "$STATE/$1.pid" ] || return 1
+	read -r pid < "$STATE/$1.pid"
 	[ -n "$pid" ] && [ -d "/proc/$pid" ]
 }
 
@@ -61,7 +70,7 @@ reply_err() { # код [текст]
 # --- методы ------------------------------------------------------------------
 
 do_info() {
-	local iface cfg exists=0 running=0 up=0 netifd_up=0
+	local iface cfg exists=0 running=0 up=0
 	local mode port endpoint sni profile log
 	local check check_running=0 cpid
 	local bypass bypass_saved remember state
@@ -74,7 +83,6 @@ do_info() {
 	[ -r "$cfg" ] && valid_cfg "$cfg" && exists=1
 	alive "$iface" && running=1
 	[ -e "$STATE/$iface.up" ] && up=1
-	[ "$(ubus call "network.interface.$iface" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = true ] && netifd_up=1
 
 	mode="$(kv "$STATE/$iface.cur" mode)"
 	port="$(kv "$STATE/$iface.cur" port)"
@@ -83,13 +91,16 @@ do_info() {
 	profile="$(kv "$STATE/$iface.cur" profile)"
 	log="$(tail -n 15 "$STATE/$iface.log" 2>/dev/null | jlines)"
 
-	cpid="$(cat "$STATE/$iface.checkpid" 2>/dev/null)"
-	[ -n "$cpid" ] && [ -d "/proc/$cpid" ] && check_running=1
+	cpid=""
+	if [ -r "$STATE/$iface.checkpid" ]; then
+		read -r cpid < "$STATE/$iface.checkpid"
+		[ -n "$cpid" ] && [ -d "/proc/$cpid" ] && check_running=1
+	fi
 	check="$(tail -n 40 "$STATE/$iface.check" 2>/dev/null | jlines)"
 
 	# С каким набором реально поднялся обход: до подключения известно только
 	# «bypass», а удачную комбинацию usque печатает в журнал сам.
-	bypass="$(sed -n 's/^.*Connected to MASQUE server via //p' "$STATE/$iface.log" 2>/dev/null | tail -n 1)"
+	bypass="$(awk '/Connected to MASQUE server via /{ v = $0; sub(/^.*Connected to MASQUE server via /, "", v) } END { print v }' "$STATE/$iface.log" 2>/dev/null)"
 
 	# Комбинация, запомненная для следующего запуска: её пробуют первой.
 	bypass_saved=""
@@ -102,8 +113,8 @@ do_info() {
 		[ -r "$state" ] && bypass_saved="$(head -n 1 "$state" 2>/dev/null)"
 	fi
 
-	printf '{"ok":true,"config_exists":%s,"running":%s,"up":%s,"netifd_up":%s,' \
-		"$(jbool $exists)" "$(jbool $running)" "$(jbool $up)" "$(jbool $netifd_up)"
+	printf '{"ok":true,"config_exists":%s,"running":%s,"up":%s,' \
+		"$(jbool $exists)" "$(jbool $running)" "$(jbool $up)"
 	printf '"mode":"%s","port":"%s","endpoint":"%s","sni":"%s","profile":"%s",' \
 		"$(jesc "$mode")" "$(jesc "$port")" "$(jesc "$endpoint")" "$(jesc "$sni")" "$(jesc "$profile")"
 	printf '"bypass":"%s","bypass_saved":"%s",' "$(jesc "$bypass")" "$(jesc "$bypass_saved")"

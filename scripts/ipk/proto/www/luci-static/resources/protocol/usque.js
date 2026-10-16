@@ -29,6 +29,37 @@ var callRegister = rpc.declare({
 	object: 'usque', method: 'register', params: [ 'config', 'name', 'force' ], expect: { '': {} }
 });
 
+/* Панель, подсказки в полях и опрос запрашивают одно и то же состояние.
+ * Общий кэш склеивает эти запросы: страница ждёт один ответ вместо трёх,
+ * а запрос, который ещё выполняется, переиспользуется. */
+var infoCache = { key: null, at: 0, p: null, done: false };
+
+function callInfoShared(sid, cfg) {
+	var key = sid + '\n' + cfg;
+	var now = Date.now();
+	if (infoCache.p && infoCache.key === key &&
+	    (!infoCache.done || now - infoCache.at < 3000))
+		return infoCache.p;
+
+	var p = callInfo(sid, cfg);
+	var entry = { key: key, at: now, p: p, done: false };
+	infoCache = entry;
+	p.then(function() {
+		if (infoCache === entry) {
+			entry.done = true;
+			entry.at = Date.now();
+		}
+	}, function() {
+		if (infoCache === entry)
+			infoCache = { key: null, at: 0, p: null, done: false };
+	});
+	return p;
+}
+
+function dropInfoCache() {
+	infoCache = { key: null, at: 0, p: null, done: false };
+}
+
 var DEFAULT_CONFIG = '/etc/usque/config.json';
 
 network.registerPatternVirtual(/^usque-.+$/);
@@ -59,6 +90,7 @@ function statusBox(sid) {
 	var nameVal = '';
 	var regOpen = false;
 	var busy = false;
+	var lastJson = null;
 
 	function row(title, value) {
 		return E('div', { 'style': 'margin:2px 0' }, [
@@ -81,7 +113,8 @@ function statusBox(sid) {
 					ui.addNotification(null, E('p', {}, 'usque: ' + (e && e.message ? e.message : e)), 'danger');
 				}).then(function() {
 					busy = false;
-					return refresh();
+					dropInfoCache();
+					return refresh(true);
 				});
 			}
 		}, label);
@@ -89,7 +122,8 @@ function statusBox(sid) {
 
 	function doRegister(nameInput, force) {
 		regOut = 'Регистрация…';
-		refresh();
+		dropInfoCache();
+		refresh(true);
 		return callRegister(cfgPath(sid), nameInput.value || '', force ? 1 : 0).then(function(r) {
 			regOut = (r.ok ? 'Готово.\n' : 'Не удалось (' + (r.code || '?') + ').\n') + (r.output || '');
 		});
@@ -205,12 +239,19 @@ function statusBox(sid) {
 		dom.content(box, kids);
 	}
 
-	function refresh() {
-		return callInfo(sid, cfgPath(sid)).then(function(info) {
+	function refresh(force) {
+		return callInfoShared(sid, cfgPath(sid)).then(function(info) {
 			if (info && info.ok === false && info.code)
 				throw new Error(info.code);
+			/* Состояние не изменилось — дерево не пересобираем: не мигает
+			 * и не теряется фокус в поле «имя устройства». */
+			var json = JSON.stringify(info || {});
+			if (!force && json === lastJson)
+				return;
+			lastJson = json;
 			render(info || {});
 		}).catch(function() {
+			lastJson = null;
 			dom.content(box, E('em', {},
 				'Панель недоступна: выполните на роутере /etc/init.d/rpcd restart и войдите в LuCI заново.'));
 		});
@@ -224,7 +265,7 @@ function statusBox(sid) {
 		if (busy) return;
 		return refresh();
 	};
-	poll.add(tick, 3);
+	poll.add(tick, 5);
 	refresh();
 
 	return box;
@@ -267,7 +308,7 @@ return network.registerProtocol('usque', {
 		function withConfigHint(opt, fn) {
 			opt.load = function(section_id) {
 				var self = this;
-				return callInfo(section_id, cfgPath(section_id)).then(function(info) {
+				return callInfoShared(section_id, cfgPath(section_id)).then(function(info) {
 					if (info) fn(self, info);
 				}).catch(function() {}).then(function() {
 					return form.Value.prototype.load.call(self, section_id);
