@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	connectip "github.com/Diniboy1123/connect-ip-go"
 	"github.com/quic-go/quic-go"
@@ -382,6 +383,11 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 
 	if proxyURL == nil {
 		transport := &http2.Transport{
+			// Брошенное без дела соединение (например, попытка проиграла
+			// перебор и её сессию закрыли) не должно висеть вечно: за нами
+			// больше некому его закрыть. Рабочий тоннель держит поток CONNECT
+			// открытым, поэтому под этот таймаут не попадает.
+			IdleConnTimeout: 90 * time.Second,
 			DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
 				dialer := &net.Dialer{}
 				conn, err := dialer.DialContext(ctx, network, endpoint.String())
@@ -412,6 +418,8 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
 		ForceAttemptHTTP2:  true,
 		DisableCompression: true,
 		TLSClientConfig:    tlsConfig,
+		// см. комментарий про брошенные соединения у http2.Transport выше
+		IdleConnTimeout: 90 * time.Second,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if addr == originAuthority {
 				addr = endpoint.String()
