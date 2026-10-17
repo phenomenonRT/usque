@@ -53,6 +53,8 @@ Usque is an open-source reimplementation of the Cloudflare WARP client's MASQUE 
 
 You can download the latest release from the [releases page](https://github.com/Diniboy1123/usque/releases). For now, Android (`arm64`), Linux (`armv5`, `armv6`, `armv7`, `arm64`, `amd64`), Windows (`arm64`, `amd64`, `386`) and Darwin (`arm64`, `amd64`) binaries are provided. **However only the Linux `amd64` binary was tested.** If you have a different platform, you can build from source.
 
+В релизах этой сборки вместе с бинарниками всех ОС публикуются пакеты для роутеров: OpenWrt — `.ipk` (инструкция: [`_docs/openwrt.md`](_docs/openwrt.md)), Keenetic (OPKG / Entware) — `.ipk` и отдельные бинарники `linux_mipsle`, `linux_mips`, `linux_armv5`, `linux_arm64` (инструкция: [`_docs/keenetic.md`](_docs/keenetic.md)). Пакеты собираются автоматически вместе с релизом.
+
 Extract the archive and you will find a binary named `usque` in the root directory. You can move this binary to a directory in your `PATH` to make it accessible from anywhere.
 
 ## Building from source

@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write  # Required for GitHub Releases and pushing the tag
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
 
     steps:
       - name: Checkout Repository
@@ -24,20 +26,25 @@ jobs:
         with:
           fetch-depth: 0  # full history + tags, required by GoReleaser
 
-      - name: Ensure release tag exists
+      - name: Resolve release tag
+        id: tag
         # On manual runs from a branch there is no tag, which makes GoReleaser
         # fail with "git doesn't contain any tags". Create one on HEAD.
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          if [ -z "$TAG" ]; then
-            TAG="v$(date -u +%Y.%m.%d)-${{ github.run_number }}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+            if [ -z "$TAG" ]; then
+              TAG="v$(date -u +%Y.%m.%d)-${{ github.run_number }}"
+            fi
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -f "$TAG"
+            git push -f origin "refs/tags/$TAG"
           fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f "$TAG"
-          git push -f origin "refs/tags/$TAG"
-          echo "Using tag $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Релиз: $TAG"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -52,3 +59,24 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Пакеты для роутеров добавляются в тот же релиз, что и бинарники всех ОС.
+  openwrt:
+    name: OpenWrt ipk
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-ipk.yml
+    with:
+      version: ${{ needs.release.outputs.tag }}
+      release: true
+
+  keenetic:
+    name: Keenetic ipk
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-keenetic.yml
+    with:
+      version: ${{ needs.release.outputs.tag }}
+      release: true

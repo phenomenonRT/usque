@@ -1,0 +1,99 @@
+#!/bin/sh
+# usque (Cloudflare WARP / MASQUE) — служба для Keenetic OS (OPKG / Entware, /opt).
+# Настройки: /opt/etc/usque/usque.conf. Ручное управление:
+#   /opt/etc/init.d/S99usque start | stop | restart | status
+# Keenetic OPKG-компонент сам выполняет скрипты из /opt/etc/init.d с аргументом start,
+# поэтому отдельный автозапуск настраивать не нужно.
+set -u
+
+PROG=/opt/bin/usque
+CONF=/opt/etc/usque/usque.conf
+LOG=/opt/var/log/usque.log
+PIDFILE=/opt/var/run/usque.pid
+
+# значения по умолчанию; переопределяются в usque.conf
+ENABLED=1
+MODE=socks
+BIND=127.0.0.1
+PORT=1080
+CONFIG=/opt/etc/usque/config.json
+ARGS=""
+
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+
+log() { echo "[usque] $*"; }
+
+running() {
+	[ -f "$PIDFILE" ] || return 1
+	pid="$(cat "$PIDFILE" 2>/dev/null)"
+	[ -n "$pid" ] || return 1
+	kill -0 "$pid" 2>/dev/null
+}
+
+mode_flags() {
+	case "$MODE" in
+	socks|http-proxy|l4-socks|l4-http-proxy) echo "-b $BIND -p $PORT" ;;
+	nativetun) echo "" ;;
+	*)
+		echo "[usque] неизвестный режим '$MODE' (socks | l4-socks | http-proxy | l4-http-proxy | nativetun)" >&2
+		return 1
+		;;
+	esac
+}
+
+start() {
+	[ "$ENABLED" = 1 ] || { log "служба выключена (ENABLED=$ENABLED в $CONF)"; return 0; }
+	running && { log "уже запущен (pid $(cat "$PIDFILE"))"; return 0; }
+	[ -x "$PROG" ] || { log "нет $PROG"; return 1; }
+	[ -f "$CONFIG" ] || { log "нет $CONFIG — сначала выполните: $PROG -c $CONFIG register"; return 1; }
+	FLAGS="$(mode_flags)" || return 1
+	mkdir -p "$(dirname "$LOG")" "$(dirname "$PIDFILE")"
+
+	# shellcheck disable=SC2086
+	if command -v nohup >/dev/null 2>&1; then
+		nohup "$PROG" -c "$CONFIG" "$MODE" $FLAGS $ARGS >>"$LOG" 2>&1 &
+	else
+		"$PROG" -c "$CONFIG" "$MODE" $FLAGS $ARGS >>"$LOG" 2>&1 </dev/null &
+	fi
+	echo $! >"$PIDFILE"
+	sleep 1
+	if running; then
+		log "запущен: $MODE $FLAGS $ARGS (pid $(cat "$PIDFILE"), журнал $LOG)"
+	else
+		rm -f "$PIDFILE"
+		log "не поднялся, смотрите журнал: $LOG"
+		return 1
+	fi
+}
+
+stop() {
+	running || { rm -f "$PIDFILE"; log "не запущен"; return 0; }
+	pid="$(cat "$PIDFILE")"
+	kill "$pid" 2>/dev/null
+	i=0
+	while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 10 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	kill -9 "$pid" 2>/dev/null
+	rm -f "$PIDFILE"
+	log "остановлен (pid $pid)"
+}
+
+status() {
+	if running; then
+		log "запущен (pid $(cat "$PIDFILE")): $MODE $ARGS"
+	else
+		log "остановлен"
+		return 1
+	fi
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+restart|reload) stop; start ;;
+status) status ;;
+*) echo "использование: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

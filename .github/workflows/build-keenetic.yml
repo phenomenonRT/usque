@@ -1,0 +1,79 @@
+name: Build Keenetic ipk
+
+# Запуск вручную: Actions → "Build Keenetic ipk" → Run workflow
+# Также вызывается из release.yml: пакеты для Keenetic добавляются в тот же релиз.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия или тег (пусто = авто, например 2026.10.17-5)"
+        required: false
+        default: ""
+      release:
+        description: "Создать/обновить GitHub Release с .ipk"
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      version:
+        description: "Версия или тег (v… необязателен)"
+        type: string
+        required: true
+      release:
+        description: "Создать/обновить GitHub Release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  keenetic:
+    name: Build Keenetic ipk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ inputs.version }}"
+          [ -n "$TAG" ] || TAG="v$(date -u +%Y.%m.%d)-${{ github.run_number }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries and .ipk (mipselsf, mipssf, armv5sf, armv7sf, aarch64)
+        run: sh scripts/build-keenetic.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Checksums
+        run: |
+          mkdir -p out
+          cp dist/keenetic/* out/
+          cd out && sha256sum * > SHA256SUMS.txt && ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usque-keenetic-${{ steps.ver.outputs.version }}
+          path: out/*
+          retention-days: 30
+
+      - name: GitHub Release
+        if: ${{ inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* \
+              --title "usque ${{ steps.ver.outputs.version }} (Keenetic)" \
+              --notes "Keenetic (Entware): usque_<версия>_<арх>_keenetic.ipk для mipselsf (mipsel-3.4), mipssf (mips-3.4), armv5sf (armv5-3.2), armv7sf (armv7-3.2) и aarch64 (aarch64-3.10), плюс отдельные бинарники usque_<версия>_linux_<арх>. Клиент /opt/bin/usque и служба /opt/etc/init.d/S99usque (настройка в /opt/etc/usque/usque.conf). Инструкция: _docs/keenetic.md" \
+              --target "${{ github.sha }}"
+          fi
